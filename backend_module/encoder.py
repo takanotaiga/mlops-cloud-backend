@@ -33,7 +33,8 @@ def encode_to_segments(input_path: str, out_dir: Optional[str] = None) -> List[s
     # 出力テンプレート
     out_tpl = str(out_dir_path / "out_%03d.mp4")
 
-    cmd = [
+    # まず NVENC で試行。失敗したら libx264 にフォールバック。
+    nvenc_cmd = [
         "ffmpeg",
         "-y",
         "-nostdin",
@@ -44,6 +45,8 @@ def encode_to_segments(input_path: str, out_dir: Optional[str] = None) -> List[s
         "h264_nvenc",
         "-preset",
         "p4",
+        "-pix_fmt",
+        "yuv420p",
         "-f",
         "segment",
         "-segment_time",
@@ -53,9 +56,39 @@ def encode_to_segments(input_path: str, out_dir: Optional[str] = None) -> List[s
         out_tpl,
     ]
 
-    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    proc = subprocess.run(nvenc_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if proc.returncode != 0:
-        raise EncodeError(f"ffmpeg failed (code {proc.returncode}):\n{proc.stderr}")
+        # NVENC が使えない場合（10bitやGPU非搭載）はCPUエンコードへ切替
+        print("CHANGED CPU ENCODE MODE")
+        x264_cmd = [
+            "ffmpeg",
+            "-y",
+            "-nostdin",
+            "-i",
+            str(src),
+            "-an",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "medium",
+            "-pix_fmt",
+            "yuv420p",
+            "-f",
+            "segment",
+            "-segment_time",
+            "180",
+            "-reset_timestamps",
+            "1",
+            out_tpl,
+        ]
+        proc2 = subprocess.run(x264_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if proc2.returncode != 0:
+            # 両方失敗した場合のみ失敗を返す（NVENC のログを含める）
+            raise EncodeError(
+                "ffmpeg failed with NVENC and libx264 fallback:\n"
+                + "--- NVENC stderr ---\n" + (proc.stderr or "")
+                + "\n--- libx264 stderr ---\n" + (proc2.stderr or "")
+            )
 
     # 生成ファイルを列挙
     outputs = sorted(str(p.resolve()) for p in out_dir_path.glob("out_*.mp4"))
