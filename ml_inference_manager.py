@@ -5,8 +5,12 @@ from pathlib import Path
 from typing import Optional, List
 
 from backend_module.database import DataBaseManager
-from backend_module.object_storage import MinioS3Uploader
+from backend_module.object_storage import MinioS3Uploader, S3Info
 from query import ml_inference_job_query
+from query.encoded_segment_query import get_segments_with_file_by_keys
+from query.utils import extract_results
+import mimetypes
+from collections import defaultdict
 
 def _get_env(name: str, default: Optional[str] = None, *, required: bool = False) -> str:
     """Read an environment variable with optional default and required flag."""
@@ -89,29 +93,98 @@ class MLInferenceRunner:
             # Prepare a per-job working directory
             work_dir = Path("work_infer") / str(job_id).split(":")[-1]
             try:
-                data_local_path = self.uploader.download_files(
+                download_result = self.uploader.download_files(
                     keys=linked_file,
                     dest_dir=work_dir
                 )
+                # Build key -> local_path mapping for successful downloads
+                key_to_local = {r.key: r.local_path for r in download_result if r.status == S3Info.SUCCESS and r.local_path}
 
-                if task_type == '' :
-                    print(data_local_path)
-                # set_inference_job_status(self.db_manager, job_id, "in_progress")
+                # Determine file types by local path; collect video keys only
+                def _is_video(path: str) -> bool:
+                    mtype, _ = mimetypes.guess_type(path)
+                    return (mtype or "").startswith("video/")
 
-                # Placeholder: download input(s) using self.uploader
-                # key = get_input_key(self.db_manager, file_id)
-                # local_src = work_dir / "input.bin"  # or appropriate filename
-                # self.uploader.download_file(key, str(local_src))
+                video_keys = [k for k, lp in key_to_local.items() if _is_video(lp)]
+                if not video_keys:
+                    print("No video files in this batch; nothing to group.")
+                    return
 
-                # Placeholder: run ML inference here
-                # results = run_inference(local_src)
+                # Fetch encoded_segment rows with joined file info for these keys
+                seg_payload = get_segments_with_file_by_keys(self.db_manager, video_keys)
+                seg_rows = extract_results(seg_payload)
 
-                # Placeholder: upload results and write DB metadata
-                # up = self.uploader.upload_file(str(result_path), key_prefix=f"inference/{file_id}")
-                # insert_inference_result(self.db_manager, file_id=file_id, key=up.key, bucket=self.uploader.bucket, meta={...})
+                # Aggregate segments by original file id
+                file_segments: dict[str, list[dict]] = defaultdict(list)
+                file_name_by_id: dict[str, str] = {}
+                file_dataset_by_id: dict[str, str] = {}
+                for row in seg_rows:
+                    key = row.get("key")
+                    meta = row.get("meta") or {}
+                    file_rid = str(row.get("file"))
+                    file_name = row.get("file_name")
+                    file_dataset = row.get("file_dataset")
+                    if key not in key_to_local:
+                        continue  # skip not downloaded
+                    file_name_by_id[file_rid] = file_name
+                    file_dataset_by_id[file_rid] = file_dataset
+                    file_segments[file_rid].append({
+                        "key": key,
+                        "local_path": key_to_local[key],
+                        "index": (meta.get("index") if isinstance(meta, dict) else None)
+                    })
 
-                # set_inference_job_status(self.db_manager, job_id, "complete")
-                pass
+                    print(meta.get("index") if isinstance(meta, dict) else None)
+                    print(meta.get("index"))
+
+                # Sort segments within each file by meta.index then by key for stability
+                for segs in file_segments.values():
+                    segs.sort(key=lambda s: (s.get("index") if isinstance(s.get("index"), (int, float)) else float("inf"), s.get("key")))
+
+                # Fetch merge groups for this job
+                mg_rows = ml_inference_job_query.get_merge_groups(self.db_manager, job_id)
+                merge_groups = mg_rows  # already a list of dicts
+
+                # Build dataset->name->file_id mapping
+                files_by_dataset_name: dict[str, dict[str, str]] = defaultdict(dict)
+                for fid, name in file_name_by_id.items():
+                    dataset = file_dataset_by_id.get(fid)
+                    if dataset and name:
+                        files_by_dataset_name[dataset][name] = fid
+
+                used_files: set[str] = set()
+                grouped: list[list[list[object]]] = []
+
+                # Compose groups for merge definitions
+                for mg in merge_groups:
+                    dataset = mg.get("dataset")
+                    members = mg.get("members") or []
+                    # Resolve member names to file ids (filtering missing)
+                    member_fids = [files_by_dataset_name.get(dataset, {}).get(name) for name in members]
+                    member_fids = [fid for fid in member_fids if fid]
+                    # Sort concatenation order by original file name
+                    member_fids.sort(key=lambda fid: (file_name_by_id.get(fid) or ""))
+
+                    seq = 1
+                    group_list: list[list[object]] = []
+                    for fid in member_fids:
+                        used_files.add(fid)
+                        for seg in file_segments.get(fid, []):
+                            group_list.append([seg["local_path"], seq])
+                            seq += 1
+                    if group_list:
+                        grouped.append(group_list)
+
+                # Add independent videos (not in any merge group)
+                for fid, segs in file_segments.items():
+                    if fid in used_files:
+                        continue
+                    group_list = [[seg["local_path"], i] for i, seg in enumerate(segs, start=1)]
+                    if group_list:
+                        grouped.append(group_list)
+
+                # For now, print the grouped structure; downstream steps can consume it
+                print(grouped)
             except Exception as e:
                 # set_inference_job_status(self.db_manager, job_id, "faild")
                 print(f"Inference job {job_id} failed: {e}")

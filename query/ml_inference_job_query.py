@@ -16,3 +16,12 @@ def get_linked_file(db_manager: DataBaseManager, job_id: str) -> List[str]:
         {"JOB_ID" : job_id}
     )
     return extract_results(payload)
+
+
+def get_merge_groups(db_manager: DataBaseManager, job_id: str) -> List[dict]:
+    """Fetch merge_group rows for datasets referenced by an inference_job."""
+    payload = db_manager.query(
+        "SELECT * FROM merge_group WHERE dataset INSIDE (array::flatten((SELECT VALUE datasets FROM inference_job WHERE id = <record> $JOB_ID)));",
+        {"JOB_ID": job_id},
+    )
+    return extract_results(payload)
