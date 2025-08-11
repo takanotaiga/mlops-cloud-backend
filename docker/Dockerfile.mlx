@@ -128,7 +128,6 @@ RUN pip install \
     py-cpuinfo \
     seaborn \
     ultralytics-thop \
-    gradio==4.44.0 \
     ffmpeg-python==0.2.0 \
     gdown==5.2 \
     lapx==0.5.10 \

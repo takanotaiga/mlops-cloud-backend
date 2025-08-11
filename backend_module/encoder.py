@@ -242,3 +242,53 @@ def probe_video(path: str) -> dict:
         info["avg_frame_rate"] = afr
 
     return info
+
+
+def create_thumbnail(
+    input_path: str,
+    output_path: str,
+    *,
+    timestamp_sec: float = 1.0,
+    width: int = 640,
+    quality: int = 2,
+) -> str:
+    """
+    指定の動画から単一フレームを切り出してサムネイルを生成する。
+
+    - ffmpeg を使用して `timestamp_sec` で 1 フレーム取得
+    - 横幅は `width` を上限にし、アスペクト比を維持（高さは -2）
+    - 失敗時は EncodeError を送出
+
+    Returns: 生成されたサムネイルの絶対パス
+    """
+    src = Path(input_path)
+    dst = Path(output_path)
+    if not src.exists():
+        raise FileNotFoundError(f"Input not found: {src}")
+
+    dst.parent.mkdir(parents=True, exist_ok=True)
+
+    vf = f"scale=min({width}\\,iw):-2"
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-nostdin",
+        "-ss",
+        str(timestamp_sec),
+        "-i",
+        str(src),
+        "-frames:v",
+        "1",
+        "-vf",
+        vf,
+        "-q:v",
+        str(quality),
+        str(dst),
+    ]
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if proc.returncode != 0 or not dst.exists():
+        raise EncodeError(
+            "ffmpeg thumbnail generation failed\n"
+            + (proc.stderr[-200:] if proc.stderr else "")
+        )
+    return str(dst.resolve())

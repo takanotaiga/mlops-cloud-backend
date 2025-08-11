@@ -6,11 +6,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from backend_module.database import DataBaseManager
 from backend_module.object_storage import MinioS3Uploader, S3Info
-from backend_module.encoder import encode_to_segments, probe_video
+from backend_module.encoder import encode_to_segments, probe_video, create_thumbnail
 from query import encode_job_query, file_query
 from query.encoded_segment_query import insert_encoded_segment
 from query.utils import rid_leaf
-import subprocess
+ 
 
 class TaskRunner:
     def __init__(self, interval=5):
@@ -178,18 +178,8 @@ class TaskRunner:
                 ts = _thumb_time(info.get("durationSec"))
                 thumb_local = work_dir / f"{name}.jpg"
 
-                cmd = [
-                    "ffmpeg", "-y", "-nostdin",
-                    "-ss", str(ts),
-                    "-i", str(local_src),
-                    "-frames:v", "1",
-                    "-vf", "scale=min(640\\,iw):-2",
-                    "-q:v", "2",
-                    str(thumb_local),
-                ]
-                proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-                if proc.returncode != 0 or not thumb_local.exists():
-                    raise RuntimeError(f"ffmpeg thumbnail failed: {proc.stderr[-200:]}\ncmd: {' '.join(cmd)}")
+                # ffmpeg呼び出しは encoder.py に委譲
+                create_thumbnail(str(local_src), str(thumb_local), timestamp_sec=ts, width=640, quality=2)
 
                 # Upload with deterministic key: <dataset>/.thumbs/<name>.jpg
                 thumb_key = f"{dataset}/.thumbs/{name}.jpg"
