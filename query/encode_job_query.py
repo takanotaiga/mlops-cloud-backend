@@ -12,22 +12,7 @@ def queue_unencoded_video_jobs(db_manager: DataBaseManager):
 def get_queued_job(db_manager: DataBaseManager) -> List[dict]:
     """取得可能な queued ジョブの配列を返す。"""
     payload = db_manager.query(
-        """
-        SELECT 
-            *
-        FROM 
-            encode_job
-        WHERE 
-            status = 'queued'
-        ORDER 
-            BY created_at ASC
-        LIMIT 
-            math::max([
-                $limit_in_progress - array::len((SELECT id FROM encode_job WHERE status = 'in_progress')),
-                0
-            ]);
-        """,
-        {"limit_in_progress": 3},
+        "SELECT * FROM encode_job WHERE status = 'queued';"
     )
     return extract_results(payload)
 

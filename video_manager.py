@@ -2,6 +2,7 @@ import time
 from pathlib import Path
 import shutil
 from typing import List
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from backend_module.database import DataBaseManager
 from backend_module.object_storage import MinioS3Uploader, S3Info
@@ -39,11 +40,11 @@ class TaskRunner:
         # キュー取得（SurrealDBの応答形式を吸収）
         jobs = encode_job_query.get_queued_job(self.db_manager)
 
-        for job in jobs:
+        def _process_job(job: dict):
             job_id = job.get("id")
             file_id = job.get("file")
             if not job_id or not file_id:
-                continue
+                return
 
             work_dir = Path("work") / rid_leaf(job_id)
             try:
@@ -74,7 +75,6 @@ class TaskRunner:
 
                 # DB 登録（各セグメントのメタ情報付与）
                 seg_infos = [probe_video(p) for p in outputs]
-                durations = [si.get("durationSec") or 0.0 for si in seg_infos]
                 total = len(outputs)
                 cumulative = 0.0
                 for idx, (local_path, up_res, info) in enumerate(zip(outputs, upload_results, seg_infos)):
@@ -125,6 +125,13 @@ class TaskRunner:
                     if work_dir.exists():
                         shutil.rmtree(work_dir, ignore_errors=True)
                 except Exception:
+                    pass
+
+        # 並列実行（最大2）
+        if jobs:
+            with ThreadPoolExecutor(max_workers=2) as ex:
+                futures = [ex.submit(_process_job, job) for job in jobs]
+                for _ in as_completed(futures):
                     pass
 
     def run(self):
