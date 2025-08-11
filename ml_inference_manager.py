@@ -2,16 +2,21 @@ import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Dict
 
 from backend_module.database import DataBaseManager
 from backend_module.object_storage import MinioS3Uploader, S3Info
 from query import ml_inference_job_query
 from query.encoded_segment_query import get_segments_with_file_by_keys
-from query.utils import extract_results
+from query.utils import extract_results, rid_leaf
+from query.annotation_query import get_key_bboxes_for_file
+from query.inference_result_query import insert_inference_result
+from ml_module.model_samurai_ulr import track_video, SeedBox
 import mimetypes
 from collections import defaultdict
 import re
+import subprocess
+import tempfile
 
 def _get_env(name: str, default: Optional[str] = None, *, required: bool = False) -> str:
     """Read an environment variable with optional default and required flag."""
@@ -84,12 +89,41 @@ class MLInferenceRunner:
 
         jobs = ml_inference_job_query.get_queued_job(self.db_manager)  # placeholder until queries are defined
 
+        def _ffmpeg_concat(inputs: List[str], out_path: str):
+            with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".txt") as f:
+                for p in inputs:
+                    f.write(f"file '{str(Path(p).resolve())}'\n")
+                list_path = f.name
+            cmd = [
+                "ffmpeg", "-y", "-nostdin",
+                "-f", "concat", "-safe", "0", "-i", list_path,
+                "-c", "copy",
+                out_path,
+            ]
+            proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            if proc.returncode != 0:
+                raise RuntimeError(f"ffmpeg concat failed: {proc.stderr[-300:]}")
+
         def _process_job(job: dict):
             job_id = job.get("id")
             task_type = job.get("taskType")
+            model = job.get("model")
+            model_source = job.get("modelSource")
             linked_file = ml_inference_job_query.get_linked_file(self.db_manager, job_id)
+            print(job)
+            # Select only SAMURAI-ULR one-shot jobs for this pipeline
             if not job_id or not task_type or len(linked_file) == 0:
+                print("hoge1")
                 return
+            if not (model == "samurai-ulr" and model_source == "internet" and task_type == "one-shot-object-detection"):
+                print("hoge2")
+                return
+
+            # Update status to running
+            try:
+                ml_inference_job_query.set_inference_job_status(self.db_manager, job_id, "ProcessRunning")
+            except Exception:
+                pass
 
             # Prepare a per-job working directory
             work_dir = Path("work_infer") / str(job_id).split(":")[-1]
@@ -200,17 +234,99 @@ class MLInferenceRunner:
                     if group_list:
                         grouped.append(group_list)
 
-                # For now, print the grouped structure; downstream steps can consume it
-                print(grouped)
+                # Process each group: track per original file, then concat results if needed
+                for gi, group in enumerate(grouped, start=1):
+                    # Determine member file ids in order of appearance
+                    file_ids_in_group: List[str] = []
+                    for p, _seq in group:
+                        # find file id owning this segment
+                        for fid, segs in file_segments.items():
+                            if any(s.get("local_path") == p for s in segs):
+                                if fid not in file_ids_in_group:
+                                    file_ids_in_group.append(fid)
+                                break
+
+                    work_gdir = work_dir / f"g_{gi:03d}"
+                    work_gdir.mkdir(parents=True, exist_ok=True)
+                    per_file_outputs: List[str] = []
+                    per_file_labels: List[str] = []
+
+                    for fid in file_ids_in_group:
+                        seg_paths = [s["local_path"] for s in file_segments.get(fid, [])]
+                        if not seg_paths:
+                            continue
+                        # concat segments of this file
+                        merged_path = str(work_gdir / f"{rid_leaf(fid)}_merged.mp4")
+                        _ffmpeg_concat(seg_paths, merged_path)
+
+                        # fetch seed boxes from annotations
+                        anns = get_key_bboxes_for_file(self.db_manager, fid)
+                        seeds: List[SeedBox] = []
+                        for a in anns:
+                            seeds.append(SeedBox(
+                                label=str(a.get("label") or ""),
+                                x1=float(a.get("x1")), y1=float(a.get("y1")),
+                                x2=float(a.get("x2")), y2=float(a.get("y2")),
+                            ))
+                        # skip if no seeds
+                        if not seeds:
+                            continue
+
+                        out_path = str(work_gdir / f"{rid_leaf(fid)}_tracked.mp4")
+                        result = track_video(merged_path, seeds, out_path=out_path, work_dir=str(work_gdir))
+                        per_file_outputs.append(result["output_path"])  # type: ignore
+                        per_file_labels.extend(result.get("labels", []))  # type: ignore
+
+                    if not per_file_outputs:
+                        continue
+
+                    # If multiple files, concat their tracked outputs
+                    if len(per_file_outputs) > 1:
+                        final_path = str(work_gdir / "group_tracked.mp4")
+                        _ffmpeg_concat(per_file_outputs, final_path)
+                    else:
+                        final_path = per_file_outputs[0]
+
+                    # Upload result video
+                    dataset = None
+                    if file_ids_in_group:
+                        dataset = file_dataset_by_id.get(file_ids_in_group[0])
+                    result_key = f"inference/{rid_leaf(job_id)}/group_{gi:03d}.mp4"
+                    up = self.uploader.upload_file_as(final_path, result_key)
+                    if up.status != S3Info.SUCCESS:
+                        raise RuntimeError(f"Upload inference result failed: {up.error}")
+
+                    # Register inference_result row
+                    size = Path(final_path).stat().st_size
+                    insert_inference_result(
+                        self.db_manager,
+                        job_id=job_id,
+                        dataset=dataset,
+                        files=file_ids_in_group,
+                        key=result_key,
+                        bucket=self.uploader.bucket,
+                        size=size,
+                        labels=sorted(set(per_file_labels)),
+                        meta={
+                            "groupIndex": gi,
+                            "sourceFiles": file_ids_in_group,
+                        },
+                    )
+
+                # All groups done -> mark job completed
+                ml_inference_job_query.set_inference_job_status(self.db_manager, job_id, "Completed")
             except Exception as e:
-                # set_inference_job_status(self.db_manager, job_id, "faild")
+                try:
+                    ml_inference_job_query.set_inference_job_status(self.db_manager, job_id, "Faild")
+                except Exception:
+                    pass
                 print(f"Inference job {job_id} failed: {e}")
             finally:
                 try:
                     if work_dir.exists() and not self.keep_work_dir:
                         # Best-effort cleanup
                         import shutil
-                        # shutil.rmtree(work_dir, ignore_errors=True)
+                        shutil.rmtree(work_dir, ignore_errors=True)
                 except Exception:
                     pass
 
@@ -236,8 +352,6 @@ class MLInferenceRunner:
             # If a cycle took longer than the schedule, push the next tick
             if end_time - start_time > self.next_time:
                 self.next_time = end_time + self.interval
-
-            exit()
 
 
 if __name__ == "__main__":

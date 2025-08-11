@@ -25,3 +25,48 @@ def get_merge_groups(db_manager: DataBaseManager, job_id: str) -> List[dict]:
         {"JOB_ID": job_id},
     )
     return extract_results(payload)
+
+
+# ---------------- Status Update API ----------------
+
+ALLOWED_STATES = {"ProcessWaiting", "ProcessRunning", "Completed", "Faild"}
+ALLOWED_NEXT = {
+    "ProcessWaiting": {"ProcessRunning"},
+    "ProcessRunning": {"Completed"},
+    "Completed": set(),
+    "Faild": set(),
+}
+
+
+def set_inference_job_status(db_manager: DataBaseManager, job_id: str, new_state: str):
+    if new_state not in ALLOWED_STATES:
+        raise ValueError(f"Unknown state: {new_state}")
+
+    cur_res = db_manager.query(
+        "SELECT VALUE status FROM inference_job WHERE id = <record> $ID LIMIT 1",
+        {"ID": job_id},
+    )
+    current = first_result(cur_res)
+    if current is None:
+        raise ValueError(f"Inference job not found: {job_id}")
+    if current == new_state:
+        return {"id": job_id, "status": current, "updated": False}
+
+    if new_state == "Faild":
+        upd = db_manager.query(
+            "UPDATE inference_job SET status = $NEW WHERE id = <record> $ID",
+            {"ID": job_id, "NEW": new_state},
+        )
+        return {"id": job_id, "status": new_state, "updated": True, "previous": current, "result": upd}
+
+    allowed = ALLOWED_NEXT.get(current, set())
+    if new_state not in allowed:
+        raise ValueError(f"Invalid transition: {current} -> {new_state}")
+
+    upd = db_manager.query(
+        "UPDATE inference_job SET status = $NEW WHERE id = <record> $ID AND status = $CUR",
+        {"ID": job_id, "NEW": new_state, "CUR": current},
+    )
+    if first_result(upd) is None:
+        raise ValueError("Concurrent update detected; state changed by another process")
+    return {"id": job_id, "status": new_state, "updated": True, "previous": current, "result": upd}
