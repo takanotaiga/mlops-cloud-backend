@@ -1,7 +1,7 @@
 import time
 from backend_module.database import DataBaseManager
 from backend_module.object_storage import MinioS3Uploader
-from query import encode_job_query
+from query import encode_job_query, file_query
 
 class TaskRunner:
     def __init__(self, interval=5):
@@ -27,7 +27,13 @@ class TaskRunner:
 
     def task_main(self):
         encode_job_query.queue_unencoded_video_jobs(self.db_manager)
-        encode_job_query.get_queued_job(self.db_manager)
+        qued_job = encode_job_query.get_queued_job(self.db_manager)
+
+        for job in qued_job:
+            print(file_query.get_s3key(self.db_manager, job["file"]))
+            print(file_query.get_file(self.db_manager, job["file"]))
+            encode_job_query.set_encode_job_status(self.db_manager, job["id"], "in_progress")
+            # print(job["file"])
 
         # resutl = self.db_manager.query(
         #     "SELECT * FROM encode_job;")

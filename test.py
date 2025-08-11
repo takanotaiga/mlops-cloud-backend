@@ -12,8 +12,14 @@ if __name__ == "__main__":
     )
 
     # 単体
-    r = uploader.upload_file("/home/taiga/horus-runner/out.mp4", key_prefix="uploads/2025-08-10")
+    # r = uploader.upload_file("/home/taiga/horus-runner/out.mp4", key_prefix="uploads/2025-08-10")
+    # print(r)
+    r = uploader.download_file(
+        key="uploads/2025-08-10/0a8557c4b65f4319-out.mp4",
+        local_path="/home/taiga/mlops-cloud-backend/out.mp4"
+    )
     print(r)
+
 
     # 複数（外側の並列はここで指定）
     # rs = uploader.upload_files(
