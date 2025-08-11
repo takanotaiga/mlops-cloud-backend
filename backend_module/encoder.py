@@ -1,4 +1,5 @@
 import subprocess
+import json
 from pathlib import Path
 from typing import List, Optional
 from backend_module.uuid_tools import get_uuid
@@ -69,3 +70,59 @@ def encode_to_segments_links(input_path: str, out_dir: Optional[str] = None) -> 
     """
     paths = encode_to_segments(input_path, out_dir)
     return [f"file://{p}" for p in paths]
+
+
+def probe_video(path: str) -> dict:
+    """ffprobeで動画情報を取得し、必要メタを返す。"""
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-print_format",
+        "json",
+        "-show_format",
+        "-show_streams",
+        path,
+    ]
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        data = json.loads(proc.stdout or "{}")
+    except Exception:
+        data = {}
+
+    streams = data.get("streams") or []
+    v = None
+    for s in streams:
+        if s.get("codec_type") == "video":
+            v = s
+            break
+    fmt = data.get("format") or {}
+
+    def _to_float(x):
+        try:
+            return float(x)
+        except Exception:
+            return None
+
+    duration = _to_float(fmt.get("duration"))
+    if duration is None and v is not None:
+        duration = _to_float(v.get("duration"))
+
+    info = {
+        "durationSec": duration,
+        "width": v.get("width") if v else None,
+        "height": v.get("height") if v else None,
+        "nb_frames": None,
+        "avg_frame_rate": None,
+        "codec_name": v.get("codec_name") if v else None,
+    }
+
+    if v is not None:
+        try:
+            info["nb_frames"] = int(v.get("nb_frames")) if v.get("nb_frames") is not None else None
+        except Exception:
+            info["nb_frames"] = None
+        afr = v.get("avg_frame_rate") or v.get("r_frame_rate")
+        info["avg_frame_rate"] = afr
+
+    return info

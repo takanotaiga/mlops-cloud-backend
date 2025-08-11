@@ -1,14 +1,12 @@
 import time
-import json
-import math
-import subprocess
 from pathlib import Path
 from typing import List
 
 from backend_module.database import DataBaseManager
 from backend_module.object_storage import MinioS3Uploader, S3Info
-from backend_module.encoder import encode_to_segments
+from backend_module.encoder import encode_to_segments, probe_video
 from query import encode_job_query, file_query
+from query.encoded_segment_query import insert_encoded_segment
 
 class TaskRunner:
     def __init__(self, interval=5):
@@ -74,7 +72,7 @@ class TaskRunner:
                     raise RuntimeError(f"Upload failed: {errs}")
 
                 # DB 登録（各セグメントのメタ情報付与）
-                seg_infos = [self._probe_video(p) for p in outputs]
+                seg_infos = [probe_video(p) for p in outputs]
                 durations = [si.get("durationSec") or 0.0 for si in seg_infos]
                 total = len(outputs)
                 cumulative = 0.0
@@ -100,7 +98,8 @@ class TaskRunner:
                         "avg_frame_rate": info.get("avg_frame_rate"),
                         "codec_name": info.get("codec_name"),
                     }
-                    self._insert_encoded_segment(
+                    insert_encoded_segment(
+                        self.db_manager,
                         file_id=file_id,
                         key=up_res.key,
                         size=size,
@@ -152,88 +151,7 @@ class TaskRunner:
         s = str(rid)
         return s.split(":", 1)[1] if ":" in s else s
 
-    @staticmethod
-    def _probe_video(path: str):
-        """ffprobeで動画情報を取得し、必要メタを返す。"""
-        cmd = [
-            "ffprobe",
-            "-v",
-            "error",
-            "-print_format",
-            "json",
-            "-show_format",
-            "-show_streams",
-            path,
-        ]
-        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        data = {}
-        try:
-            data = json.loads(proc.stdout or "{}")
-        except Exception:
-            data = {}
-
-        # 代表ストリーム（video）を特定
-        streams = data.get("streams") or []
-        v = None
-        for s in streams:
-            if s.get("codec_type") == "video":
-                v = s
-                break
-        fmt = data.get("format") or {}
-
-        def _to_float(x):
-            try:
-                return float(x)
-            except Exception:
-                return None
-
-        duration = _to_float(fmt.get("duration"))
-        if duration is None and v is not None:
-            duration = _to_float(v.get("duration"))
-
-        info = {
-            "durationSec": duration,
-            "width": v.get("width") if v else None,
-            "height": v.get("height") if v else None,
-            "nb_frames": None,
-            "avg_frame_rate": None,
-            "codec_name": v.get("codec_name") if v else None,
-        }
-
-        if v is not None:
-            # フレーム数
-            try:
-                info["nb_frames"] = int(v.get("nb_frames")) if v.get("nb_frames") is not None else None
-            except Exception:
-                info["nb_frames"] = None
-            # フレームレート
-            afr = v.get("avg_frame_rate") or v.get("r_frame_rate")
-            info["avg_frame_rate"] = afr
-
-        return info
-
-    def _insert_encoded_segment(self, *, file_id, key: str, size: int, bucket: str, meta: dict):
-        """エンコード結果を DB に登録する。"""
-        self.db_manager.query(
-            """
-            INSERT INTO encoded_segment {
-                file: <record> $FILE,
-                key: $KEY,
-                type: 'video-segment',
-                size: $SIZE,
-                uploadedAt: time::now(),
-                bucket: $BUCKET,
-                meta: $META
-            };
-            """,
-            {
-                "FILE": file_id,
-                "KEY": key,
-                "SIZE": size,
-                "BUCKET": bucket,
-                "META": meta,
-            },
-        )
+    
 
 
 if __name__ == "__main__":
