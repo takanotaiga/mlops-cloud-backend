@@ -244,6 +244,88 @@ def probe_video(path: str) -> dict:
     return info
 
 
+def transcode_video(
+    input_path: str,
+    output_path: Optional[str] = None,
+    *,
+    nvenc_quality: Optional[NvencQuality] = None,
+    x264_crf: int = 20,
+) -> str:
+    """
+    Re-encode a single video file to H.264 to reduce size.
+
+    - Prefers NVENC (h264_nvenc) with recommended quality; falls back to libx264 CRF.
+    - Returns absolute path to the output.
+    """
+    src = Path(input_path)
+    if not src.exists():
+        raise FileNotFoundError(f"Input not found: {src}")
+
+    # Determine output path
+    if output_path is None:
+        dst = src.with_name(src.stem + "_enc.mp4")
+    else:
+        dst = Path(output_path)
+    if dst.parent:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+
+    # Pick quality params
+    try:
+        meta = probe_video(str(src))
+    except Exception:
+        meta = {}
+    q = nvenc_quality or _recommend_quality(meta)
+
+    # NVENC attempt
+    nvenc_cmd = [
+        "ffmpeg", "-y", "-nostdin",
+        "-i", str(src),
+        "-c:v", "h264_nvenc",
+        "-preset", q.preset,
+        "-rc", q.rc,
+        "-b:v", f"{q.target_kbps}k",
+        "-maxrate", f"{q.max_kbps}k",
+        "-bufsize", f"{q.buf_kbps}k",
+        "-profile:v", q.profile,
+        "-rc-lookahead", str(q.rc_lookahead),
+        "-spatial_aq", str(q.spatial_aq),
+        "-temporal_aq", str(q.temporal_aq),
+        "-aq-strength", str(q.aq_strength),
+        "-bf", str(q.b_frames),
+        "-g", str(q.gop),
+        "-tune", "hq",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac",
+        "-b:a", "128k",
+        str(dst),
+    ]
+    proc = subprocess.run(nvenc_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if proc.returncode != 0:
+        # libx264 fallback
+        x264_cmd = [
+            "ffmpeg", "-y", "-nostdin",
+            "-i", str(src),
+            "-c:v", "libx264",
+            "-preset", "slow",
+            "-crf", str(x264_crf),
+            "-bf", "3",
+            "-g", "240",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac",
+            "-b:a", "128k",
+            str(dst),
+        ]
+        proc2 = subprocess.run(x264_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if proc2.returncode != 0 or not dst.exists():
+            raise EncodeError(
+                "ffmpeg transcode failed with NVENC and libx264 fallback:\n"
+                + "--- NVENC stderr ---\n" + (proc.stderr or "")
+                + "\n--- libx264 stderr ---\n" + (proc2.stderr or "")
+            )
+
+    return str(dst.resolve())
+
+
 def create_thumbnail(
     input_path: str,
     output_path: str,

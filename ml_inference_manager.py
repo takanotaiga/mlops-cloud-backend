@@ -12,6 +12,7 @@ from query.utils import extract_results, rid_leaf
 from query.annotation_query import get_key_bboxes_for_file
 from query.inference_result_query import insert_inference_result
 from ml_module.model_samurai_ulr import track_video, SeedBox
+from backend_module.encoder import transcode_video
 import mimetypes
 from collections import defaultdict
 import re
@@ -287,17 +288,25 @@ class MLInferenceRunner:
                     else:
                         final_path = per_file_outputs[0]
 
+                    # Optionally compress/transcode the final result to reduce size
+                    enc_final_path = str(work_gdir / "group_tracked_enc.mp4")
+                    try:
+                        enc_final_path = transcode_video(final_path, output_path=enc_final_path)
+                    except Exception as _e:
+                        # If transcode fails, fall back to the original
+                        enc_final_path = final_path
+
                     # Upload result video
                     dataset = None
                     if file_ids_in_group:
                         dataset = file_dataset_by_id.get(file_ids_in_group[0])
                     result_key = f"inference/{rid_leaf(job_id)}/group_{gi:03d}.mp4"
-                    up = self.uploader.upload_file_as(final_path, result_key)
+                    up = self.uploader.upload_file_as(enc_final_path, result_key)
                     if up.status != S3Info.SUCCESS:
                         raise RuntimeError(f"Upload inference result failed: {up.error}")
 
                     # Register inference_result row
-                    size = Path(final_path).stat().st_size
+                    size = Path(enc_final_path).stat().st_size
                     insert_inference_result(
                         self.db_manager,
                         job_id=job_id,
