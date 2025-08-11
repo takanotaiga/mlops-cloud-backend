@@ -6,7 +6,7 @@ from typing import Optional, List
 
 from backend_module.database import DataBaseManager
 from backend_module.object_storage import MinioS3Uploader
-
+from query import ml_inference_job_query
 
 def _get_env(name: str, default: Optional[str] = None, *, required: bool = False) -> str:
     """Read an environment variable with optional default and required flag."""
@@ -61,6 +61,8 @@ class MLInferenceRunner:
         )
 
         self.next_time = time.time()
+        # Keep per-job work directories for debugging when true-ish
+        self.keep_work_dir = _get_env("KEEP_WORK_DIR", "0").lower() in ("1", "true", "yes", "on")
 
     def task_main(self):
         """
@@ -75,19 +77,25 @@ class MLInferenceRunner:
         The concrete schema/queries are intentionally omitted.
         """
 
-        # Example skeleton (commented out; adapt to your schema):
-        # jobs = get_queued_inference_jobs(self.db_manager)
-        jobs: List[dict] = []  # placeholder until queries are defined
+        jobs = ml_inference_job_query.get_queued_job(self.db_manager)  # placeholder until queries are defined
 
         def _process_job(job: dict):
             job_id = job.get("id")
-            file_id = job.get("file")
-            if not job_id or not file_id:
+            task_type = job.get("taskType")
+            linked_file = ml_inference_job_query.get_linked_file(self.db_manager, job_id)
+            if not job_id or not task_type or len(linked_file) == 0:
                 return
 
             # Prepare a per-job working directory
             work_dir = Path("work_infer") / str(job_id).split(":")[-1]
             try:
+                data_local_path = self.uploader.download_files(
+                    keys=linked_file,
+                    dest_dir=work_dir
+                )
+
+                if task_type == '' :
+                    print(data_local_path)
                 # set_inference_job_status(self.db_manager, job_id, "in_progress")
 
                 # Placeholder: download input(s) using self.uploader
@@ -109,15 +117,15 @@ class MLInferenceRunner:
                 print(f"Inference job {job_id} failed: {e}")
             finally:
                 try:
-                    if work_dir.exists():
+                    if work_dir.exists() and not self.keep_work_dir:
                         # Best-effort cleanup
                         import shutil
-                        shutil.rmtree(work_dir, ignore_errors=True)
+                        # shutil.rmtree(work_dir, ignore_errors=True)
                 except Exception:
                     pass
 
         if jobs:
-            with ThreadPoolExecutor(max_workers=2) as ex:
+            with ThreadPoolExecutor(max_workers=1) as ex:
                 futures = [ex.submit(_process_job, job) for job in jobs]
                 for _ in as_completed(futures):
                     pass
@@ -139,8 +147,9 @@ class MLInferenceRunner:
             if end_time - start_time > self.next_time:
                 self.next_time = end_time + self.interval
 
+            exit()
+
 
 if __name__ == "__main__":
     runner = MLInferenceRunner()
     runner.run()
-

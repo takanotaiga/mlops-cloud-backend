@@ -1,4 +1,4 @@
-from typing import Any, Optional, List
+from typing import List
 from backend_module.database import DataBaseManager
 from query.utils import first_result, extract_results
 
