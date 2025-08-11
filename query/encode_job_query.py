@@ -1,5 +1,6 @@
-from typing import Any, Optional
+from typing import Any, Optional, List
 from backend_module.database import DataBaseManager
+from query.utils import first_result, extract_results
 
 
 def queue_unencoded_video_jobs(db_manager: DataBaseManager):
@@ -8,8 +9,9 @@ def queue_unencoded_video_jobs(db_manager: DataBaseManager):
     )
 
 
-def get_queued_job(db_manager: DataBaseManager):
-    res = db_manager.query(
+def get_queued_job(db_manager: DataBaseManager) -> List[dict]:
+    """取得可能な queued ジョブの配列を返す。"""
+    payload = db_manager.query(
         """
         SELECT 
             *
@@ -27,7 +29,7 @@ def get_queued_job(db_manager: DataBaseManager):
         """,
         {"limit_in_progress": 3},
     )
-    return res
+    return extract_results(payload)
 
 
 # ---------------- Status Update API ----------------
@@ -40,14 +42,6 @@ class InvalidJobTransition(Exception):
     pass
 
 
-def _first_result(payload: Any) -> Optional[Any]:
-    if isinstance(payload, list) and payload:
-        first = payload[0]
-        if isinstance(first, dict) and "result" in first:
-            results = first.get("result") or []
-            return results[0] if results else None
-        return first
-    return None
 
 
 ALLOWED_STATES = {"queued", "in_progress", "faild", "complete"}
@@ -75,7 +69,7 @@ def set_encode_job_status(db_manager: DataBaseManager, job_id: str, new_state: s
         "SELECT VALUE status FROM encode_job WHERE id = <record> $ID LIMIT 1",
         {"ID": job_id},
     )
-    current = _first_result(cur_res)
+    current = first_result(cur_res)
     if current is None:
         raise JobNotFound(f"Encode job not found: {job_id}")
 
@@ -102,7 +96,7 @@ def set_encode_job_status(db_manager: DataBaseManager, job_id: str, new_state: s
         {"ID": job_id, "NEW": new_state, "CUR": current},
     )
     # 更新できなかった場合（並行更新等）はブロック
-    if _first_result(upd) is None:
+    if first_result(upd) is None:
         raise InvalidJobTransition("Concurrent update detected; state changed by another process")
 
     return {"id": job_id, "status": new_state, "updated": True, "previous": current, "result": upd}

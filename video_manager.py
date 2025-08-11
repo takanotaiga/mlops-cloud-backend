@@ -7,6 +7,7 @@ from backend_module.object_storage import MinioS3Uploader, S3Info
 from backend_module.encoder import encode_to_segments, probe_video
 from query import encode_job_query, file_query
 from query.encoded_segment_query import insert_encoded_segment
+from query.utils import rid_leaf
 
 class TaskRunner:
     def __init__(self, interval=5):
@@ -35,8 +36,7 @@ class TaskRunner:
         encode_job_query.queue_unencoded_video_jobs(self.db_manager)
 
         # キュー取得（SurrealDBの応答形式を吸収）
-        raw = encode_job_query.get_queued_job(self.db_manager)
-        jobs = self._extract_results(raw)
+        jobs = encode_job_query.get_queued_job(self.db_manager)
 
         for job in jobs:
             job_id = job.get("id")
@@ -52,7 +52,7 @@ class TaskRunner:
                 s3_key = file_query.get_s3key(self.db_manager, file_id)
 
                 # 作業ディレクトリ準備
-                work_dir = Path("work") / self._rid_leaf(job_id)
+                work_dir = Path("work") / rid_leaf(job_id)
                 work_dir.mkdir(parents=True, exist_ok=True)
                 filename = s3_key.rstrip("/").split("/")[-1]
                 local_src = work_dir / filename
@@ -66,7 +66,7 @@ class TaskRunner:
                 outputs: List[str] = encode_to_segments(str(local_src), out_dir=str(work_dir / "encoded"))
 
                 # アップロード（encoded/<file_id>/ 配下に格納）
-                upload_results = self.uploader.upload_files(outputs, key_prefix=f"encoded/{self._rid_leaf(file_id)}")
+                upload_results = self.uploader.upload_files(outputs, key_prefix=f"encoded/{rid_leaf(file_id)}")
                 if any(r.status != S3Info.SUCCESS for r in upload_results):
                     errs = ", ".join(f"{r.local_path}:{r.error}" for r in upload_results if r.status != S3Info.SUCCESS)
                     raise RuntimeError(f"Upload failed: {errs}")
@@ -134,22 +134,7 @@ class TaskRunner:
             if end_time - start_time > self.next_time:
                 self.next_time = end_time + self.interval
 
-    @staticmethod
-    def _extract_results(payload):
-        """SurrealDBクエリ応答からレコード配列を抽出する。"""
-        if isinstance(payload, list) and payload:
-            first = payload[0]
-            if isinstance(first, dict) and "result" in first:
-                return first.get("result") or []
-            # 既にレコード配列が返っているケース
-            return payload
-        return []
-
-    @staticmethod
-    def _rid_leaf(rid) -> str:
-        """Record ID をパス用に文字列化。'table:id' -> 'id' を返す。"""
-        s = str(rid)
-        return s.split(":", 1)[1] if ":" in s else s
+    
 
     
 
