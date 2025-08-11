@@ -5,7 +5,7 @@ from query.utils import first_result, extract_results
 
 def queue_unencoded_video_jobs(db_manager: DataBaseManager):
     db_manager.query(
-        "INSERT INTO encode_job (SELECT time::now() AS created_at, id AS file, 'queued' AS status FROM file WHERE encode = 'video-none' AND mime ~ 'video/' AND id NOTINSIDE (SELECT VALUE file FROM encode_job));"
+        "INSERT INTO encode_job (SELECT time::now() AS created_at, id AS file, 'queued' AS status FROM file WHERE encode INSIDE ['video-none','video-merge'] AND mime ~ 'video/' AND id NOTINSIDE (SELECT VALUE file FROM encode_job));"
     )
 
 
