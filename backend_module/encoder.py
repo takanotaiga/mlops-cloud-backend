@@ -1,7 +1,8 @@
 import subprocess
 import json
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
+from dataclasses import dataclass
 from backend_module.uuid_tools import get_uuid
 
 
@@ -9,7 +10,52 @@ class EncodeError(Exception):
     """Raised when ffmpeg encoding fails."""
 
 
-def encode_to_segments(input_path: str, out_dir: Optional[str] = None) -> List[str]:
+@dataclass
+class NvencQuality:
+    # 目標/上限/バッファ（kbps）
+    target_kbps: int
+    max_kbps: int
+    buf_kbps: int
+    # 品質関連
+    preset: str = "p5"  # p1..p7（大きいほど高品質・低速）
+    profile: str = "high"
+    rc: str = "vbr_hq"  # vbr_hq が高品質
+    rc_lookahead: int = 32
+    spatial_aq: int = 1
+    temporal_aq: int = 1
+    aq_strength: int = 8  # 0..15 推奨8-12
+    b_frames: int = 3
+    gop: int = 240
+
+
+def _parse_fps(s: Optional[str]) -> Optional[float]:
+    if not s:
+        return None
+    try:
+        if "/" in s:
+            n, d = s.split("/", 1)
+            return float(n) / float(d)
+        return float(s)
+    except Exception:
+        return None
+
+
+def _recommend_quality(meta: dict) -> NvencQuality:
+    width = meta.get("width") or 1920
+    fps = _parse_fps(meta.get("avg_frame_rate")) or 30.0
+    # 高動き前提でやや高めのビットレートを推奨
+    if width >= 3800 or fps >= 50:
+        return NvencQuality(target_kbps=50000, max_kbps=65000, buf_kbps=130000, preset="p5")
+    if width >= 2560:
+        return NvencQuality(target_kbps=24000, max_kbps=32000, buf_kbps=64000, preset="p5")
+    if width >= 1920:
+        return NvencQuality(target_kbps=12000, max_kbps=18000, buf_kbps=36000, preset="p5")
+    if width >= 1280:
+        return NvencQuality(target_kbps=7000, max_kbps=10000, buf_kbps=20000, preset="p5")
+    return NvencQuality(target_kbps=4000, max_kbps=6000, buf_kbps=12000, preset="p5")
+
+
+def encode_to_segments(input_path: str, out_dir: Optional[str] = None, *, nvenc_quality: Optional[NvencQuality] = None) -> List[str]:
     """
     指定された動画ファイルをffmpegで分割エンコードし、生成されたファイルの絶対パスを返す。
 
@@ -33,6 +79,13 @@ def encode_to_segments(input_path: str, out_dir: Optional[str] = None) -> List[s
     # 出力テンプレート
     out_tpl = str(out_dir_path / "out_%03d.mp4")
 
+    # 入力メタから品質推奨を決定
+    try:
+        meta = probe_video(str(src))
+    except Exception:
+        meta = {}
+    q = nvenc_quality or _recommend_quality(meta)
+
     # まず NVENC で試行。失敗したら libx264 にフォールバック。
     nvenc_cmd = [
         "ffmpeg",
@@ -44,7 +97,31 @@ def encode_to_segments(input_path: str, out_dir: Optional[str] = None) -> List[s
         "-c:v",
         "h264_nvenc",
         "-preset",
-        "p4",
+        q.preset,
+        "-rc",
+        q.rc,
+        "-b:v",
+        f"{q.target_kbps}k",
+        "-maxrate",
+        f"{q.max_kbps}k",
+        "-bufsize",
+        f"{q.buf_kbps}k",
+        "-profile:v",
+        q.profile,
+        "-rc-lookahead",
+        str(q.rc_lookahead),
+        "-spatial_aq",
+        str(q.spatial_aq),
+        "-temporal_aq",
+        str(q.temporal_aq),
+        "-aq-strength",
+        str(q.aq_strength),
+        "-bf",
+        str(q.b_frames),
+        "-g",
+        str(q.gop),
+        "-tune",
+        "hq",
         "-pix_fmt",
         "yuv420p",
         "-f",
@@ -70,7 +147,13 @@ def encode_to_segments(input_path: str, out_dir: Optional[str] = None) -> List[s
             "-c:v",
             "libx264",
             "-preset",
-            "medium",
+            "slow",
+            "-crf",
+            "18",
+            "-bf",
+            "3",
+            "-g",
+            "240",
             "-pix_fmt",
             "yuv420p",
             "-f",
