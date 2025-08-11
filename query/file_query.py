@@ -26,3 +26,29 @@ def get_s3key(db_manager: DataBaseManager, file_id):
     if key is None:
         raise FileRecordNotFound(f"File not found: {file_id}")
     return key
+
+
+def list_videos_missing_thumbs(db_manager: DataBaseManager, *, limit: int = 50):
+    """Return file rows for videos missing a thumbnail key."""
+    res = db_manager.query(
+        """
+        SELECT id, key, dataset, name, thumbKey
+        FROM file
+        WHERE mime ~ 'video/' AND (thumbKey = NONE OR thumbKey = null OR string::len(thumbKey) = 0)
+        LIMIT $LIMIT;
+        """,
+        {"LIMIT": limit},
+    )
+    # return raw rows; caller handles iteration
+    from query.utils import extract_results
+    return extract_results(res)
+
+
+def set_thumb_key(db_manager: DataBaseManager, file_id, thumb_key: str):
+    """Update the file.thumbKey for a given file record."""
+    return db_manager.query(
+        """
+        UPDATE file SET thumbKey = $THUMB WHERE id = <record> $ID RETURN AFTER;
+        """,
+        {"ID": file_id, "THUMB": thumb_key},
+    )

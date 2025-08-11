@@ -123,6 +123,27 @@ class MinioS3Uploader:
         except Exception as e:
             return UploadResult(str(p), None, S3Info.UPLOAD_FAILED, str(e))
 
+    def upload_file_as(self, local_path: str, key: str) -> UploadResult:
+        """Upload a single file using the exact provided key (no UUID suffixing)."""
+        p = Path(local_path)
+        if not p.exists():
+            return UploadResult(str(p), None, S3Info.FILE_NOT_FOUND, "File not found")
+
+        extra_args = {"ContentType": self._infer_content_type(str(p))}
+        try:
+            self.s3.upload_file(
+                Filename=str(p),
+                Bucket=self.bucket,
+                Key=key,
+                ExtraArgs=extra_args,
+                Config=self.transfer_config,
+            )
+            return UploadResult(str(p), key, S3Info.SUCCESS)
+        except (ClientError, BotoCoreError) as e:
+            return UploadResult(str(p), None, S3Info.UPLOAD_FAILED, str(e))
+        except Exception as e:
+            return UploadResult(str(p), None, S3Info.UPLOAD_FAILED, str(e))
+
     def upload_files(
         self,
         files: Iterable[str],

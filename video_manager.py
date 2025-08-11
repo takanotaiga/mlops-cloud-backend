@@ -10,6 +10,7 @@ from backend_module.encoder import encode_to_segments, probe_video
 from query import encode_job_query, file_query
 from query.encoded_segment_query import insert_encoded_segment
 from query.utils import rid_leaf
+import subprocess
 
 class TaskRunner:
     def __init__(self, interval=5):
@@ -34,6 +35,11 @@ class TaskRunner:
         self.next_time = time.time()
 
     def task_main(self):
+        # 1) サムネイル作成（優先処理）
+        if self._process_missing_thumbnails():
+            # サムネイルを処理した場合は、このサイクルではここで終了（優先度を担保）
+            return
+
         # 新規ジョブをエンキュー
         encode_job_query.queue_unencoded_video_jobs(self.db_manager)
 
@@ -135,6 +141,75 @@ class TaskRunner:
                 futures = [ex.submit(_process_job, job) for job in jobs]
                 for _ in as_completed(futures):
                     pass
+
+    def _process_missing_thumbnails(self) -> bool:
+        """Create and register thumbnails for videos missing thumbKey.
+
+        Returns True if any thumbnails were processed (to prioritize over encoding).
+        """
+        rows = file_query.list_videos_missing_thumbs(self.db_manager, limit=16)
+        if not rows:
+            return False
+
+        def _thumb_time(duration: float | None) -> float:
+            # pick a safe time within the video
+            if not duration or duration <= 0:
+                return 1.0
+            return max(0.5, min(5.0, duration * 0.1))
+
+        for row in rows:
+            file_id = row.get("id")
+            s3_key = row.get("key")
+            dataset = row.get("dataset")
+            name = row.get("name")
+            if not file_id or not s3_key or not dataset or not name:
+                continue
+
+            work_dir = Path("work_thumb") / rid_leaf(file_id)
+            try:
+                work_dir.mkdir(parents=True, exist_ok=True)
+                local_src = work_dir / s3_key.rstrip("/").split("/")[-1]
+
+                dl = self.uploader.download_file(s3_key, str(local_src))
+                if dl.status != S3Info.SUCCESS:
+                    raise RuntimeError(f"Download failed: {dl.error}")
+
+                info = probe_video(str(local_src))
+                ts = _thumb_time(info.get("durationSec"))
+                thumb_local = work_dir / f"{name}.jpg"
+
+                cmd = [
+                    "ffmpeg", "-y", "-nostdin",
+                    "-ss", str(ts),
+                    "-i", str(local_src),
+                    "-frames:v", "1",
+                    "-vf", "scale=min(640\\,iw):-2",
+                    "-q:v", "2",
+                    str(thumb_local),
+                ]
+                proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                if proc.returncode != 0 or not thumb_local.exists():
+                    raise RuntimeError(f"ffmpeg thumbnail failed: {proc.stderr[-200:]}\ncmd: {' '.join(cmd)}")
+
+                # Upload with deterministic key: <dataset>/.thumbs/<name>.jpg
+                thumb_key = f"{dataset}/.thumbs/{name}.jpg"
+                up = self.uploader.upload_file_as(str(thumb_local), thumb_key)
+                if up.status != S3Info.SUCCESS:
+                    raise RuntimeError(f"Upload thumb failed: {up.error}")
+
+                # Register thumbKey on file
+                file_query.set_thumb_key(self.db_manager, file_id, thumb_key)
+
+            except Exception as e:
+                print(f"Thumbnail generation failed for {file_id}: {e}")
+            finally:
+                try:
+                    if work_dir.exists():
+                        shutil.rmtree(work_dir, ignore_errors=True)
+                except Exception:
+                    pass
+
+        return True
 
     def run(self):
         while True:
