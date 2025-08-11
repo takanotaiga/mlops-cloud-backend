@@ -99,7 +99,11 @@ class MinioS3Uploader:
         if not p.exists():
             return UploadResult(str(p), None, S3Info.FILE_NOT_FOUND, "File not found")
 
-        key_name = f"{get_uuid(16)}-{p.name}"
+        # Place UUID after the filename (before extension) to keep lexicographic
+        # ordering by base name stable across variant uploads.
+        stem = p.stem
+        suffix = p.suffix  # including dot, e.g., '.mp4'
+        key_name = f"{stem}-{get_uuid(16)}{suffix}"
         key = posixpath.join(key_prefix.strip("/"), key_name) if key_prefix else key_name
 
         extra_args = {"ContentType": self._infer_content_type(str(p))}

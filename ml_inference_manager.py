@@ -11,6 +11,7 @@ from query.encoded_segment_query import get_segments_with_file_by_keys
 from query.utils import extract_results
 import mimetypes
 from collections import defaultdict
+import re
 
 def _get_env(name: str, default: Optional[str] = None, *, required: bool = False) -> str:
     """Read an environment variable with optional default and required flag."""
@@ -137,9 +138,25 @@ class MLInferenceRunner:
                     print(meta.get("index") if isinstance(meta, dict) else None)
                     print(meta.get("index"))
 
-                # Sort segments within each file by meta.index then by key for stability
+                # Sort segments within each file by numeric meta.index,
+                # with a robust fallback to the local filename pattern out_###.
+                def _seg_sort_key(seg: dict):
+                    idx = seg.get("index")
+                    try:
+                        idx_num = int(idx)
+                    except Exception:
+                        idx_num = None
+                    if idx_num is not None:
+                        return (0, idx_num)
+                    # fallback: parse from local filename like out_003-xxxx.mp4
+                    base = os.path.basename(seg.get("local_path") or "")
+                    m = re.search(r"out_(\d+)", base)
+                    if m:
+                        return (1, int(m.group(1)))
+                    return (2, base)
+
                 for segs in file_segments.values():
-                    segs.sort(key=lambda s: (s.get("index") if isinstance(s.get("index"), (int, float)) else float("inf"), s.get("key")))
+                    segs.sort(key=_seg_sort_key)
 
                 # Fetch merge groups for this job
                 mg_rows = ml_inference_job_query.get_merge_groups(self.db_manager, job_id)

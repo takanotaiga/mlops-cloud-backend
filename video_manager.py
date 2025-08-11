@@ -77,17 +77,19 @@ class TaskRunner:
                 seg_infos = [probe_video(p) for p in outputs]
                 total = len(outputs)
                 cumulative = 0.0
-                for idx, (local_path, up_res, info) in enumerate(zip(outputs, upload_results, seg_infos)):
-                    if up_res.key is None:
-                        # 保険（ここまでに弾いているが念のため）
-                        raise RuntimeError("Uploaded key missing")
+                # アップロード結果を local_path -> key で引けるようにする
+                path_to_key = {r.local_path: r.key for r in upload_results if r.status == S3Info.SUCCESS and r.key}
+                for idx, (local_path, info) in enumerate(zip(outputs, seg_infos), start=1):
+                    up_key = path_to_key.get(local_path)
+                    if not up_key:
+                        raise RuntimeError(f"Uploaded key missing for {local_path}")
                     size = Path(local_path).stat().st_size
                     start_sec = cumulative
                     end_sec = cumulative + (info.get("durationSec") or 0.0)
                     cumulative = end_sec
                     meta = {
                         "durationSec": info.get("durationSec"),
-                        "index": idx + 1,  # 1-based
+                        "index": idx,  # 1-based, outputs の順序に一致
                         "total": total,
                         "startSec": start_sec,
                         "endSec": end_sec,
@@ -102,7 +104,7 @@ class TaskRunner:
                     insert_encoded_segment(
                         self.db_manager,
                         file_id=file_id,
-                        key=up_res.key,
+                        key=up_key,
                         size=size,
                         bucket=self.uploader.bucket,
                         meta=meta,
