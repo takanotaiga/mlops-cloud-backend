@@ -15,6 +15,8 @@ class S3Info(IntEnum):
     SUCCESS = auto()
     FILE_NOT_FOUND = auto()
     UPLOAD_FAILED = auto()
+    DOWNLOAD_FAILED = auto()
+    OBJECT_NOT_FOUND = auto()
 
 @dataclass
 class UploadResult:
@@ -23,6 +25,13 @@ class UploadResult:
     status: S3Info
     error: Optional[str] = None
 
+
+@dataclass
+class DownloadResult:
+    key: str
+    local_path: Optional[str]
+    status: S3Info
+    error: Optional[str] = None
 
 class MinioS3Uploader:
     """
@@ -133,6 +142,108 @@ class MinioS3Uploader:
                     res = UploadResult(fut_map[fut], None, S3Info.UPLOAD_FAILED, str(e))
                 results.append(res)
         return results
+
+    # --------- download API ---------
+
+    def download_file(
+        self,
+        key: str,
+        local_path: str,
+        *,
+        overwrite: bool = True,
+    ) -> DownloadResult:
+        """
+        指定キーをローカルへダウンロード（大容量対応）。
+
+        - boto3 の TransferManager を利用し、閾値超は自動マルチパート並列
+        - 既定では上書き（overwrite=True）。False の場合は既存ファイルで失敗
+        """
+        p = Path(local_path)
+        if p.exists() and not overwrite:
+            return DownloadResult(key, str(p), S3Info.DOWNLOAD_FAILED, "Local file exists")
+
+        # 保存先ディレクトリを用意
+        if p.parent:
+            p.parent.mkdir(parents=True, exist_ok=True)
+
+        # 事前に存在確認（NoSuchKey の早期検出）
+        try:
+            self.s3.head_object(Bucket=self.bucket, Key=key)
+        except (ClientError, BotoCoreError) as e:
+            code = getattr(e, "response", {}).get("Error", {}).get("Code") if hasattr(e, "response") else None
+            if code in {"404", "NoSuchKey", "NotFound"}:
+                return DownloadResult(key, None, S3Info.OBJECT_NOT_FOUND, str(e))
+            # head 失敗時も後続 download で再試行される可能性があるため続行せずエラー返却
+            return DownloadResult(key, None, S3Info.DOWNLOAD_FAILED, str(e))
+
+        try:
+            self.s3.download_file(
+                Bucket=self.bucket,
+                Key=key,
+                Filename=str(p),
+                Config=self.transfer_config,
+            )
+            return DownloadResult(key, str(p), S3Info.SUCCESS)
+        except (ClientError, BotoCoreError) as e:
+            code = getattr(e, "response", {}).get("Error", {}).get("Code") if hasattr(e, "response") else None
+            if code in {"404", "NoSuchKey", "NotFound"}:
+                return DownloadResult(key, None, S3Info.OBJECT_NOT_FOUND, str(e))
+            return DownloadResult(key, str(p), S3Info.DOWNLOAD_FAILED, str(e))
+        except Exception as e:
+            return DownloadResult(key, str(p), S3Info.DOWNLOAD_FAILED, str(e))
+
+    def download_files(
+        self,
+        keys: Iterable[str],
+        dest_dir: str,
+        *,
+        max_workers: int = 4,
+        keep_key_paths: bool = False,
+    ) -> List[DownloadResult]:
+        """
+        複数キーを並列ダウンロード。
+
+        - keep_key_paths=True で S3 のキー階層をそのまま配下に再現
+        - False の場合はファイル名のみを dest_dir 直下に保存
+        """
+        dest = Path(dest_dir)
+        dest.mkdir(parents=True, exist_ok=True)
+
+        def _target_path(k: str) -> str:
+            if keep_key_paths:
+                return str(dest.joinpath(k))
+            # キー末尾名のみ
+            name = k.rstrip("/").split("/")[-1]
+            return str(dest.joinpath(name))
+
+        results: List[DownloadResult] = []
+        ks = list(keys)
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            fut_map = {ex.submit(self.download_file, k, _target_path(k)): k for k in ks}
+            for fut in as_completed(fut_map):
+                try:
+                    res = fut.result()
+                except Exception as e:
+                    res = DownloadResult(fut_map[fut], None, S3Info.DOWNLOAD_FAILED, str(e))
+                results.append(res)
+        return results
+
+    def stream_object(self, key: str, chunk_size: int = 8 * 1024 * 1024):
+        """
+        S3オブジェクトをチャンク単位でストリーミングするジェネレータ。
+        大容量データを逐次処理する用途向け。
+        """
+        try:
+            resp = self.s3.get_object(Bucket=self.bucket, Key=key)
+        except (ClientError, BotoCoreError) as e:
+            code = getattr(e, "response", {}).get("Error", {}).get("Code") if hasattr(e, "response") else None
+            if code in {"404", "NoSuchKey", "NotFound"}:
+                return
+            raise
+        body = resp["Body"]
+        for chunk in body.iter_chunks(chunk_size):
+            if chunk:
+                yield chunk
 
     # --------- helper ---------
 
