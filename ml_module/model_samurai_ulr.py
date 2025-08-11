@@ -11,7 +11,7 @@ import os
 import os.path as osp
 import tempfile
 from dataclasses import dataclass
-from typing import List, Optional, Dict, Tuple
+from typing import List, Optional, Dict, Tuple, Any
 
 import cv2
 import numpy as np
@@ -83,6 +83,17 @@ def _overlay_masks_and_boxes(frame: np.ndarray, masks: Dict[int, np.ndarray], bo
     return img
 
 
+def _to_int(x) -> int:
+    try:
+        return int(x.item())  # torch scalar
+    except Exception:
+        try:
+            return int(x)
+        except Exception:
+            # last resort
+            return int(str(x))
+
+
 def track_video(
     video_path: str,
     seeds: List[SeedBox],
@@ -131,12 +142,14 @@ def track_video(
 
         # Propagate and render frame-by-frame to avoid high memory usage
         for frame_idx, object_ids, masks in predictor.propagate_in_video(state):
-            frame_path = osp.join(frames_dir, f"{frame_idx + 1:08d}.jpg")
+            fi = _to_int(frame_idx)
+            frame_path = osp.join(frames_dir, f"{fi + 1:08d}.jpg")
             frame = cv2.imread(frame_path)
             # prepare overlays
             mask_map: Dict[int, np.ndarray] = {}
             bbox_map: Dict[int, Tuple[int, int, int, int]] = {}
-            for obj_id, mask in zip(object_ids, masks):
+            obj_ids_py = [ _to_int(oid) for oid in (object_ids or []) ]
+            for obj_id, mask in zip(obj_ids_py, masks):
                 mask_np = mask[0].detach().cpu().numpy() > 0.0
                 mask_map[obj_id] = mask_np
                 nz = np.argwhere(mask_np)
@@ -172,3 +185,69 @@ def track_video(
         "labels": [s.label for s in seeds],
     }
 
+
+# ---------------- Adapter for inference pipeline ----------------
+
+from pathlib import Path
+from query.annotation_query import get_key_bboxes_for_file
+from backend_module.encoder import concat_videos
+
+
+class SamuraiULRModel:
+    """Adapter that prepares inputs and runs SAM2 tracking per group of files.
+
+    file_group: list of dicts, each like {
+        'file_id': <rid or leaf>,
+        'dataset': <str>,
+        'name': <str>,
+        'segments': [<local segment paths in order>]
+    }
+    """
+
+    def process_group(self, db_manager, file_group: List[Dict[str, Any]], work_dir: str) -> Dict[str, Any]:
+        work = Path(work_dir)
+        work.mkdir(parents=True, exist_ok=True)
+
+        per_file_outputs: List[str] = []
+        per_file_labels: List[str] = []
+
+        for item in file_group:
+            fid = item.get("file_id")
+            segs = item.get("segments") or []
+            if not segs:
+                continue
+            merged = str(work / f"{Path(str(fid)).name}_merged.mp4")
+            concat_videos(segs, merged)
+
+            # fetch seed boxes from annotations for this file
+            anns = get_key_bboxes_for_file(db_manager, fid)
+            seeds: List[SeedBox] = []
+            for a in anns:
+                try:
+                    seeds.append(SeedBox(
+                        label=str(a.get("label") or ""),
+                        x1=float(a.get("x1")), y1=float(a.get("y1")),
+                        x2=float(a.get("x2")), y2=float(a.get("y2")),
+                    ))
+                except Exception:
+                    continue
+            if not seeds:
+                # if no seeds, skip this file
+                continue
+
+            out_path = str(work / f"{Path(str(fid)).name}_tracked.mp4")
+            result = track_video(merged, seeds, out_path=out_path, work_dir=str(work))
+            per_file_outputs.append(result["output_path"])  # type: ignore
+            per_file_labels.extend(result.get("labels", []))  # type: ignore
+
+        if not per_file_outputs:
+            return {"output_path": None, "labels": []}
+
+        # concat per-file outputs if more than one
+        if len(per_file_outputs) > 1:
+            final_path = str(work / "group_tracked.mp4")
+            concat_videos(per_file_outputs, final_path)
+        else:
+            final_path = per_file_outputs[0]
+
+        return {"output_path": final_path, "labels": sorted(set(per_file_labels))}

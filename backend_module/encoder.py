@@ -1,4 +1,5 @@
 import subprocess
+import tempfile
 import json
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -374,3 +375,36 @@ def create_thumbnail(
             + (proc.stderr[-200:] if proc.stderr else "")
         )
     return str(dst.resolve())
+
+
+def concat_videos(inputs: List[str], output_path: str) -> str:
+    """
+    Concatenate multiple video files losslessly using ffmpeg concat demuxer.
+
+    inputs: ordered list of file paths with identical codec/parameters.
+    output_path: destination file path (e.g., .mp4). Returns absolute path.
+    """
+    if not inputs:
+        raise ValueError("No inputs provided for concatenation")
+    out = Path(output_path)
+    if out.parent:
+        out.parent.mkdir(parents=True, exist_ok=True)
+
+    # Write a temporary list file for ffmpeg concat demuxer
+    with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".txt") as f:
+        for p in inputs:
+            f.write(f"file '{str(Path(p).resolve())}'\n")
+        list_path = f.name
+
+    cmd = [
+        "ffmpeg", "-y", "-nostdin",
+        "-f", "concat", "-safe", "0", "-i", list_path,
+        "-c", "copy",
+        str(out),
+    ]
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if proc.returncode != 0 or not out.exists():
+        raise EncodeError(
+            "ffmpeg concat failed\n" + (proc.stderr[-300:] if proc.stderr else "")
+        )
+    return str(out.resolve())

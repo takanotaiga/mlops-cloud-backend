@@ -9,15 +9,12 @@ from backend_module.object_storage import MinioS3Uploader, S3Info
 from query import ml_inference_job_query
 from query.encoded_segment_query import get_segments_with_file_by_keys
 from query.utils import extract_results, rid_leaf
-from query.annotation_query import get_key_bboxes_for_file
 from query.inference_result_query import insert_inference_result
-from ml_module.model_samurai_ulr import track_video, SeedBox
+from ml_module.registry import get_model
 from backend_module.encoder import transcode_video
 import mimetypes
 from collections import defaultdict
 import re
-import subprocess
-import tempfile
 
 def _get_env(name: str, default: Optional[str] = None, *, required: bool = False) -> str:
     """Read an environment variable with optional default and required flag."""
@@ -90,34 +87,17 @@ class MLInferenceRunner:
 
         jobs = ml_inference_job_query.get_queued_job(self.db_manager)  # placeholder until queries are defined
 
-        def _ffmpeg_concat(inputs: List[str], out_path: str):
-            with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".txt") as f:
-                for p in inputs:
-                    f.write(f"file '{str(Path(p).resolve())}'\n")
-                list_path = f.name
-            cmd = [
-                "ffmpeg", "-y", "-nostdin",
-                "-f", "concat", "-safe", "0", "-i", list_path,
-                "-c", "copy",
-                out_path,
-            ]
-            proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            if proc.returncode != 0:
-                raise RuntimeError(f"ffmpeg concat failed: {proc.stderr[-300:]}")
-
         def _process_job(job: dict):
             job_id = job.get("id")
             task_type = job.get("taskType")
             model = job.get("model")
             model_source = job.get("modelSource")
             linked_file = ml_inference_job_query.get_linked_file(self.db_manager, job_id)
-            print(job)
-            # Select only SAMURAI-ULR one-shot jobs for this pipeline
+            # Select model adapter based on job
             if not job_id or not task_type or len(linked_file) == 0:
-                print("hoge1")
                 return
-            if not (model == "samurai-ulr" and model_source == "internet" and task_type == "one-shot-object-detection"):
-                print("hoge2")
+            model_adapter = get_model(model, model_source, task_type)
+            if model_adapter is None:
                 return
 
             # Update status to running
@@ -235,7 +215,7 @@ class MLInferenceRunner:
                     if group_list:
                         grouped.append(group_list)
 
-                # Process each group: track per original file, then concat results if needed
+                # Process each group via the selected model adapter
                 for gi, group in enumerate(grouped, start=1):
                     # Determine member file ids in order of appearance
                     file_ids_in_group: List[str] = []
@@ -246,47 +226,29 @@ class MLInferenceRunner:
                                 if fid not in file_ids_in_group:
                                     file_ids_in_group.append(fid)
                                 break
-
+                    
                     work_gdir = work_dir / f"g_{gi:03d}"
                     work_gdir.mkdir(parents=True, exist_ok=True)
-                    per_file_outputs: List[str] = []
-                    per_file_labels: List[str] = []
-
+                    # Build model input group
+                    model_group = []
                     for fid in file_ids_in_group:
                         seg_paths = [s["local_path"] for s in file_segments.get(fid, [])]
                         if not seg_paths:
                             continue
-                        # concat segments of this file
-                        merged_path = str(work_gdir / f"{rid_leaf(fid)}_merged.mp4")
-                        _ffmpeg_concat(seg_paths, merged_path)
-
-                        # fetch seed boxes from annotations
-                        anns = get_key_bboxes_for_file(self.db_manager, fid)
-                        seeds: List[SeedBox] = []
-                        for a in anns:
-                            seeds.append(SeedBox(
-                                label=str(a.get("label") or ""),
-                                x1=float(a.get("x1")), y1=float(a.get("y1")),
-                                x2=float(a.get("x2")), y2=float(a.get("y2")),
-                            ))
-                        # skip if no seeds
-                        if not seeds:
-                            continue
-
-                        out_path = str(work_gdir / f"{rid_leaf(fid)}_tracked.mp4")
-                        result = track_video(merged_path, seeds, out_path=out_path, work_dir=str(work_gdir))
-                        per_file_outputs.append(result["output_path"])  # type: ignore
-                        per_file_labels.extend(result.get("labels", []))  # type: ignore
-
-                    if not per_file_outputs:
+                        model_group.append({
+                            "file_id": fid,
+                            "dataset": file_dataset_by_id.get(fid),
+                            "name": file_name_by_id.get(fid),
+                            "segments": seg_paths,
+                        })
+                    if not model_group:
                         continue
 
-                    # If multiple files, concat their tracked outputs
-                    if len(per_file_outputs) > 1:
-                        final_path = str(work_gdir / "group_tracked.mp4")
-                        _ffmpeg_concat(per_file_outputs, final_path)
-                    else:
-                        final_path = per_file_outputs[0]
+                    model_res = model_adapter.process_group(self.db_manager, model_group, str(work_gdir))
+                    final_path = model_res.get("output_path")
+                    labels = model_res.get("labels", []) or []
+                    if not final_path:
+                        continue
 
                     # Optionally compress/transcode the final result to reduce size
                     enc_final_path = str(work_gdir / "group_tracked_enc.mp4")
@@ -315,7 +277,7 @@ class MLInferenceRunner:
                         key=result_key,
                         bucket=self.uploader.bucket,
                         size=size,
-                        labels=sorted(set(per_file_labels)),
+                        labels=sorted(set(labels)),
                         meta={
                             "groupIndex": gi,
                             "sourceFiles": file_ids_in_group,
