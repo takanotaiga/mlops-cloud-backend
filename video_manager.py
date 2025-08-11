@@ -1,5 +1,6 @@
 import time
 from pathlib import Path
+import shutil
 from typing import List
 
 from backend_module.database import DataBaseManager
@@ -44,6 +45,7 @@ class TaskRunner:
             if not job_id or not file_id:
                 continue
 
+            work_dir = Path("work") / rid_leaf(job_id)
             try:
                 # ステータスを in_progress へ
                 encode_job_query.set_encode_job_status(self.db_manager, job_id, "in_progress")
@@ -52,7 +54,6 @@ class TaskRunner:
                 s3_key = file_query.get_s3key(self.db_manager, file_id)
 
                 # 作業ディレクトリ準備
-                work_dir = Path("work") / rid_leaf(job_id)
                 work_dir.mkdir(parents=True, exist_ok=True)
                 filename = s3_key.rstrip("/").split("/")[-1]
                 local_src = work_dir / filename
@@ -118,6 +119,13 @@ class TaskRunner:
                     pass
                 # ログ代わりに出力
                 print(f"Job {job_id} failed: {e}")
+            finally:
+                # 成功・失敗を問わずローカル作業ディレクトリを削除
+                try:
+                    if work_dir.exists():
+                        shutil.rmtree(work_dir, ignore_errors=True)
+                except Exception:
+                    pass
 
     def run(self):
         while True:
