@@ -1,5 +1,6 @@
 import os
 import os.path as osp
+import json
 import tempfile
 from dataclasses import dataclass
 from typing import List, Optional, Dict, Tuple, Any
@@ -7,6 +8,10 @@ from typing import List, Optional, Dict, Tuple, Any
 import cv2
 import numpy as np
 import torch
+import pandas as pd
+import duckdb  # type: ignore
+import pyarrow as pa  # type: ignore
+import pyarrow.parquet as pq  # type: ignore
 
 # SAM2 predictor
 import sys
@@ -31,6 +36,18 @@ def _ensure_dir(p: str):
     os.makedirs(p, exist_ok=True)
 
 
+def _get_total_frame_count(video_path: str) -> int:
+    cap = cv2.VideoCapture(video_path)
+    try:
+        if not cap.isOpened():
+            raise RuntimeError(f"Failed to open video: {video_path}")
+        # Try property first; may be 0 for some codecs
+        cnt = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        return max(0, cnt)
+    finally:
+        cap.release()
+
+
 def _extract_frames(video_path: str, out_dir: str) -> Tuple[int, int, int, float]:
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -45,6 +62,9 @@ def _extract_frames(video_path: str, out_dir: str) -> Tuple[int, int, int, float
             if not ret:
                 break
             count += 1
+            # Hard safety: abort if frame count threshold exceeded during extraction
+            if count >= 27000:
+                raise ValueError("Video has 27000 or more frames; aborting per policy.")
             cv2.imwrite(osp.join(out_dir, f"{count:08d}.jpg"), frame, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
     finally:
         cap.release()
@@ -245,9 +265,104 @@ def track_video(
 
 
 # New helpers to support per-key prediction and final combined overlay
-def _run_single_seed_collect_masks(frames_dir: str, width: int, height: int, seed: SeedBox, out_dir: str, device: str = "cuda:0") -> None:
-    os.makedirs(out_dir, exist_ok=True)
+class _ResultsSink:
+    """Append-only sink that writes results to Parquet and DuckDB as we go."""
 
+    def __init__(self, parquet_path: str, duckdb_path: str):
+        self.parquet_path = parquet_path
+        self.duckdb_path = duckdb_path
+        self._rows: List[Dict[str, Any]] = []
+        self._batch_size = 500
+
+        self._arrow_schema = pa.schema([
+            (pa.field("file_id", pa.string())),
+            (pa.field("video_name", pa.string())),
+            (pa.field("seed_index", pa.int32())),
+            (pa.field("label", pa.string())),
+            (pa.field("frame_index", pa.int32())),
+            (pa.field("x", pa.int32())),
+            (pa.field("y", pa.int32())),
+            (pa.field("w", pa.int32())),
+            (pa.field("h", pa.int32())),
+            (pa.field("area", pa.int64())),
+        ])
+        self._pq_writer: Optional[pq.ParquetWriter] = None
+
+        # Prepare DuckDB and table
+        self._con = duckdb.connect(self.duckdb_path)
+        self._con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS results (
+                file_id TEXT,
+                video_name TEXT,
+                seed_index INTEGER,
+                label TEXT,
+                frame_index INTEGER,
+                x INTEGER,
+                y INTEGER,
+                w INTEGER,
+                h INTEGER,
+                area BIGINT
+            )
+            """
+        )
+
+    def append(self, row: Dict[str, Any]):
+        self._rows.append(row)
+        if len(self._rows) >= self._batch_size:
+            self._flush()
+
+    def _flush(self):
+        if not self._rows:
+            return
+        df = pd.DataFrame(self._rows, columns=[
+            "file_id", "video_name", "seed_index", "label", "frame_index", "x", "y", "w", "h", "area"
+        ])
+        # Append to DuckDB
+        self._con.register("_df_tmp", df)
+        try:
+            self._con.execute("INSERT INTO results SELECT * FROM _df_tmp")
+        finally:
+            self._con.unregister("_df_tmp")
+        # Append to Parquet
+        table = pa.Table.from_pandas(df, schema=self._arrow_schema, preserve_index=False)
+        if self._pq_writer is None:
+            self._pq_writer = pq.ParquetWriter(self.parquet_path, self._arrow_schema)
+        self._pq_writer.write_table(table)
+        self._rows.clear()
+
+    def close(self):
+        self._flush()
+        if self._pq_writer is not None:
+            self._pq_writer.close()
+            self._pq_writer = None
+        if self._con is not None:
+            self._con.close()
+            self._con = None  # type: ignore
+
+
+def _results_schema_json() -> dict:
+    return {
+        "name": "samurai_ulr_inference",
+        "version": 1,
+        "description": "Per-frame object tracking results (bounding boxes)",
+        "fields": [
+            {"name": "file_id", "type": "string", "description": "SurrealDB file record id"},
+            {"name": "video_name", "type": "string", "description": "Original video logical name"},
+            {"name": "seed_index", "type": "int", "description": "Index of seed box for the object"},
+            {"name": "label", "type": "string", "description": "Label of the seed box"},
+            {"name": "frame_index", "type": "int", "description": "Zero-based frame index"},
+            {"name": "x", "type": "int", "description": "Top-left x"},
+            {"name": "y", "type": "int", "description": "Top-left y"},
+            {"name": "w", "type": "int", "description": "Width of bbox"},
+            {"name": "h", "type": "int", "description": "Height of bbox"},
+            {"name": "area", "type": "int", "description": "Mask area in pixels"}
+        ],
+    }
+
+
+def _run_single_seed_collect(frames_dir: str, width: int, height: int, seed: SeedBox, seed_index: int,
+                             file_id: str, video_name: str, sink: _ResultsSink, *, device: str = "cuda:0") -> None:
     predictor = build_sam2_video_predictor(MODEL_CONFIG, MODEL_PATH, device=device)
     # Use autocast only on CUDA device
     autocast_device = "cuda" if str(device).startswith("cuda") else "cpu"
@@ -264,9 +379,9 @@ def _run_single_seed_collect_masks(frames_dir: str, width: int, height: int, see
         for _it in predictor.propagate_in_video(state):
             frame_idx, _object_ids, masks = _normalize_propagate_item(_it)
             fi = _to_int(frame_idx)
-            # Normalize masks to a list to avoid boolean evaluation on tensors
             if masks is None:
                 continue
+            # Normalize as list
             if isinstance(masks, torch.Tensor):
                 masks_seq = [masks]
             else:
@@ -279,48 +394,69 @@ def _run_single_seed_collect_masks(frames_dir: str, width: int, height: int, see
             mask_np = _to_2d_bool_mask(masks_seq[0])
             if mask_np is None:
                 continue
-            np.save(osp.join(out_dir, f"{fi:08d}.npy"), mask_np, allow_pickle=False)
+            nz = np.argwhere(mask_np)
+            if nz.size == 0 or nz.shape[1] < 2:
+                bx = by = bw = bh = 0
+                area = 0
+            else:
+                y_min, x_min = nz.min(axis=0).tolist()
+                y_max, x_max = nz.max(axis=0).tolist()
+                bx, by, bw, bh = x_min, y_min, max(0, x_max - x_min), max(0, y_max - y_min)
+                area = int(mask_np.sum())
+
+            sink.append({
+                "file_id": str(file_id),
+                "video_name": str(video_name),
+                "seed_index": int(seed_index),
+                "label": str(seed.label),
+                "frame_index": int(fi),
+                "x": int(bx),
+                "y": int(by),
+                "w": int(bw),
+                "h": int(bh),
+                "area": int(area),
+            })
 
 
-def _compose_masks_to_video(frames_dir: str, seed_labels: Dict[int, str], mask_dirs: Dict[int, str], *,
-                            frame_count: int, width: int, height: int, fps: float, out_path: str) -> str:
+def _plot_from_parquet(frames_dir: str, results_parquet: str, *,
+                       frame_count: int, width: int, height: int, fps: float, out_path: str) -> str:
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(out_path, fourcc, fps or 30.0, (width, height))
 
     try:
+        # Load recorded results
+        df = pd.read_parquet(results_parquet)
+        # Group rows by frame_index for quick lookup
+        groups = df.groupby("frame_index")
         for fi in range(frame_count):
             frame_path = osp.join(frames_dir, f"{fi + 1:08d}.jpg")
             frame = cv2.imread(frame_path)
             if frame is None:
                 # If frame missing, skip gracefully
                 continue
-
-            mask_map: Dict[int, np.ndarray] = {}
+            # Prepare overlay from saved bboxes
             bbox_map: Dict[int, Tuple[int, int, int, int]] = {}
+            labels_by_id: Dict[int, str] = {}
+            try:
+                g = groups.get_group(fi)
+            except Exception:
+                g = None
+            if g is not None:
+                for _, row in g.iterrows():
+                    obj_id = int(row["seed_index"])  # one obj per seed
+                    x, y, w, h = int(row["x"]), int(row["y"]), int(row["w"]), int(row["h"])
+                    bbox_map[obj_id] = (x, y, w, h)
+                    labels_by_id[obj_id] = str(row["label"]) if not pd.isna(row["label"]) else f"id:{obj_id}"
 
-            for obj_id, mdir in mask_dirs.items():
-                mpath = osp.join(mdir, f"{fi:08d}.npy")
-                if not osp.exists(mpath):
-                    continue
-                try:
-                    mask_np = np.load(mpath, allow_pickle=False)
-                except Exception:
-                    continue
-                # Ensure mask is 2D bool in case file contains an array of different shape
-                mask_bool = _to_2d_bool_mask(mask_np)
-                if mask_bool is None:
-                    continue
-                mask_map[obj_id] = mask_bool
-                nz = np.argwhere(mask_bool)
-                if nz.size == 0 or nz.shape[1] < 2:
-                    bbox_map[obj_id] = (0, 0, 0, 0)
-                else:
-                    y_min, x_min = nz.min(axis=0).tolist()
-                    y_max, x_max = nz.max(axis=0).tolist()
-                    bbox_map[obj_id] = (x_min, y_min, max(0, x_max - x_min), max(0, y_max - y_min))
-
-            composed = _overlay_masks_and_boxes(frame, mask_map, bbox_map, seed_labels)
-            writer.write(composed)
+            # Draw simple rectangles and labels
+            img = frame
+            for obj_id, (x, y, w, h) in bbox_map.items():
+                rng = (37 * (obj_id + 1)) % 255
+                c = (int(50 + rng) % 255, int(120 + 2*rng) % 255, int(200 + 3*rng) % 255)
+                cv2.rectangle(img, (x, y), (x + w, y + h), c, 2)
+                text = labels_by_id.get(obj_id, f"id:{obj_id}")
+                cv2.putText(img, text, (x, max(0, y - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, c, 2, lineType=cv2.LINE_AA)
+            writer.write(img)
     finally:
         writer.release()
 
@@ -351,6 +487,13 @@ class SamuraiULRModel:
 
         per_file_outputs: List[str] = []
         per_file_labels: List[str] = []
+        schema_json_path = str(work / "samurai_ulr_schema.json")
+        # Write schema JSON once per group
+        try:
+            with open(schema_json_path, "w", encoding="utf-8") as f:
+                json.dump(_results_schema_json(), f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
 
         for item in file_group:
             fid = item.get("file_id")
@@ -379,34 +522,35 @@ class SamuraiULRModel:
             # Extract frames once for this file
             frames_dir = str(work / f"{Path(str(fid)).name}_frames")
             _ensure_dir(frames_dir)
+            # Pre-check total frames; reject >= 27000
+            total_fc = _get_total_frame_count(merged)
+            if total_fc >= 27000:
+                raise ValueError(f"Video {merged} has {total_fc} frames (>=27000); rejecting before inference.")
             frame_count, width, height, fps = _extract_frames(merged, frames_dir)
 
-            # Run predict strictly one key per call and collect masks
-            mask_dirs: Dict[int, str] = {}
-            labels_by_id: Dict[int, str] = {}
-            for si, seed in enumerate(seeds):
-                mask_dir_i = str(work / f"{Path(str(fid)).name}_masks_{si:03d}")
-                _run_single_seed_collect_masks(frames_dir, width, height, seed, mask_dir_i)
-                mask_dirs[si] = mask_dir_i
-                labels_by_id[si] = seed.label
+            # Prepare results sink (Parquet + DuckDB) for this file
+            parquet_path = str(work / f"{Path(str(fid)).name}_results.parquet")
+            duckdb_path = str(work / f"{Path(str(fid)).name}_results.duckdb")
+            sink = _ResultsSink(parquet_path, duckdb_path)
 
-            # Compose all masks simultaneously into one overlaid video
+            # Run predict strictly one key per call and record results
+            for si, seed in enumerate(seeds):
+                _run_single_seed_collect(
+                    frames_dir, width, height, seed, si, str(fid), str(item.get("name") or ""), sink
+                )
+            sink.close()
+
+            # Plotting: read saved results and overlay per-frame bboxes
             out_path = str(work / f"{Path(str(fid)).name}_tracked.mp4")
-            _compose_masks_to_video(frames_dir, labels_by_id, mask_dirs,
-                                    frame_count=frame_count, width=width, height=height, fps=fps,
-                                    out_path=out_path)
+            _plot_from_parquet(frames_dir, parquet_path,
+                               frame_count=frame_count, width=width, height=height, fps=fps,
+                               out_path=out_path)
 
             per_file_outputs.append(out_path)
             per_file_labels.extend([s.label for s in seeds])
 
             # Cleanup masks and frames for this file (best-effort)
             try:
-                for _k, mdir in mask_dirs.items():
-                    try:
-                        import shutil
-                        shutil.rmtree(mdir, ignore_errors=True)
-                    except Exception:
-                        pass
                 # cleanup frames
                 for f in os.listdir(frames_dir):
                     if f.endswith('.jpg'):
@@ -422,7 +566,7 @@ class SamuraiULRModel:
                 pass
 
         if not per_file_outputs:
-            return {"output_path": None, "labels": []}
+            return {"output_path": None, "labels": [], "schema_json_path": schema_json_path}
 
         # concat per-file outputs if more than one
         if len(per_file_outputs) > 1:
@@ -431,4 +575,4 @@ class SamuraiULRModel:
         else:
             final_path = per_file_outputs[0]
 
-        return {"output_path": final_path, "labels": sorted(set(per_file_labels))}
+        return {"output_path": final_path, "labels": sorted(set(per_file_labels)), "schema_json_path": schema_json_path}

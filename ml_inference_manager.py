@@ -247,6 +247,7 @@ class MLInferenceRunner:
                     model_res = model_adapter.process_group(self.db_manager, model_group, str(work_gdir))
                     final_path = model_res.get("output_path")
                     labels = model_res.get("labels", []) or []
+                    schema_json_path = model_res.get("schema_json_path")
                     if not final_path:
                         continue
 
@@ -281,8 +282,37 @@ class MLInferenceRunner:
                         meta={
                             "groupIndex": gi,
                             "sourceFiles": file_ids_in_group,
+                            "artifact": "plot_video",
                         },
                     )
+
+                    # Upload schema JSON alongside the plot video and register to DB
+                    try:
+                        if schema_json_path and os.path.exists(schema_json_path):
+                            schema_key = f"inference/{rid_leaf(job_id)}/group_{gi:03d}_schema.json"
+                            up_js = self.uploader.upload_file_as(schema_json_path, schema_key)
+                            if up_js.status != S3Info.SUCCESS:
+                                raise RuntimeError(f"Upload schema JSON failed: {up_js.error}")
+                            size_js = Path(schema_json_path).stat().st_size
+                            insert_inference_result(
+                                self.db_manager,
+                                job_id=job_id,
+                                dataset=dataset,
+                                files=file_ids_in_group,
+                                key=schema_key,
+                                bucket=self.uploader.bucket,
+                                size=size_js,
+                                labels=[],
+                                meta={
+                                    "groupIndex": gi,
+                                    "sourceFiles": file_ids_in_group,
+                                    "artifact": "schema_json",
+                                    "contentType": "application/json",
+                                },
+                            )
+                    except Exception as _e:
+                        # Fail schema upload softly without failing the whole job
+                        print(f"Schema JSON upload/insert skipped due to error: {_e}")
 
                 # All groups done -> mark job completed
                 ml_inference_job_query.set_inference_job_status(self.db_manager, job_id, "Completed")
