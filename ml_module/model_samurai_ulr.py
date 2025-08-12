@@ -1,12 +1,3 @@
-"""
-SAM2-based video object tracking integrated for this project.
-
-This module provides a minimal, dependency-light wrapper around
-Meta's SAM2 video predictor to track multiple objects from initial
-bounding boxes and render a result video. It purposely avoids the
-previous YOLO/horus/gradio utilities.
-"""
-
 import os
 import os.path as osp
 import tempfile
