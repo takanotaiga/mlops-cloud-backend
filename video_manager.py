@@ -19,14 +19,14 @@ class TaskRunner:
             endpoint_url="ws://192.168.1.25:65303/rpc",
             username="root",
             password="root",
-            namespace="test",
-            database="test"
+            namespace="mlops",
+            database="cloud_ui"
         )
         self.uploader = MinioS3Uploader(
             endpoint_url="http://192.168.1.25:65300",
             access_key="minioadmin",
             secret_key="minioadmin",
-            bucket="horus-bucket",
+            bucket="mlops-datasets",
             multipart_threshold_bytes=300 * 1024 * 1024,  # 300MB
             multipart_chunksize_bytes=64 * 1024 * 1024,   # 128MB
             part_concurrency=4,

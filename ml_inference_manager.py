@@ -39,14 +39,14 @@ class MLInferenceRunner:
         surreal_endpoint = _get_env("SURREAL_ENDPOINT", "ws://192.168.1.25:65303/rpc")
         surreal_username = _get_env("SURREAL_USERNAME", "root")
         surreal_password = _get_env("SURREAL_PASSWORD", "root")
-        surreal_namespace = _get_env("SURREAL_NAMESPACE", "test")
-        surreal_database = _get_env("SURREAL_DATABASE", "test")
+        surreal_namespace = _get_env("SURREAL_NAMESPACE", "mlops")
+        surreal_database = _get_env("SURREAL_DATABASE", "cloud_ui")
 
         # S3/MinIO configuration (env-driven with local-dev defaults)
         s3_endpoint = _get_env("S3_ENDPOINT", "http://192.168.1.25:65300")
         s3_access_key = _get_env("S3_ACCESS_KEY", "minioadmin")
         s3_secret_key = _get_env("S3_SECRET_KEY", "minioadmin")
-        s3_bucket = _get_env("S3_BUCKET", "horus-bucket")
+        s3_bucket = _get_env("S3_BUCKET", "mlops-datasets")
 
         # Initialize database manager (thread-safe query)
         self.db_manager = DataBaseManager(
