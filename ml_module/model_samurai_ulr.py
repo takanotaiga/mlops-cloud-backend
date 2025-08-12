@@ -9,7 +9,6 @@ import cv2
 import numpy as np
 import torch
 import pandas as pd
-import duckdb  # type: ignore
 import pyarrow as pa  # type: ignore
 import pyarrow.parquet as pq  # type: ignore
 
@@ -268,9 +267,8 @@ def track_video(
 class _ResultsSink:
     """Append-only sink that writes results to Parquet and DuckDB as we go."""
 
-    def __init__(self, parquet_path: str, duckdb_path: str):
+    def __init__(self, parquet_path: str):
         self.parquet_path = parquet_path
-        self.duckdb_path = duckdb_path
         self._rows: List[Dict[str, Any]] = []
         self._batch_size = 500
 
@@ -288,25 +286,6 @@ class _ResultsSink:
         ])
         self._pq_writer: Optional[pq.ParquetWriter] = None
 
-        # Prepare DuckDB and table
-        self._con = duckdb.connect(self.duckdb_path)
-        self._con.execute(
-            """
-            CREATE TABLE IF NOT EXISTS results (
-                file_id TEXT,
-                video_name TEXT,
-                seed_index INTEGER,
-                label TEXT,
-                frame_index INTEGER,
-                x INTEGER,
-                y INTEGER,
-                w INTEGER,
-                h INTEGER,
-                area BIGINT
-            )
-            """
-        )
-
     def append(self, row: Dict[str, Any]):
         self._rows.append(row)
         if len(self._rows) >= self._batch_size:
@@ -318,12 +297,6 @@ class _ResultsSink:
         df = pd.DataFrame(self._rows, columns=[
             "file_id", "video_name", "seed_index", "label", "frame_index", "x", "y", "w", "h", "area"
         ])
-        # Append to DuckDB
-        self._con.register("_df_tmp", df)
-        try:
-            self._con.execute("INSERT INTO results SELECT * FROM _df_tmp")
-        finally:
-            self._con.unregister("_df_tmp")
         # Append to Parquet
         table = pa.Table.from_pandas(df, schema=self._arrow_schema, preserve_index=False)
         if self._pq_writer is None:
@@ -336,9 +309,6 @@ class _ResultsSink:
         if self._pq_writer is not None:
             self._pq_writer.close()
             self._pq_writer = None
-        if self._con is not None:
-            self._con.close()
-            self._con = None  # type: ignore
 
 
 def _results_schema_json() -> dict:
@@ -487,6 +457,7 @@ class SamuraiULRModel:
 
         per_file_outputs: List[str] = []
         per_file_labels: List[str] = []
+        results_artifacts: List[Dict[str, str]] = []
         schema_json_path = str(work / "samurai_ulr_schema.json")
         # Write schema JSON once per group
         try:
@@ -530,8 +501,7 @@ class SamuraiULRModel:
 
             # Prepare results sink (Parquet + DuckDB) for this file
             parquet_path = str(work / f"{Path(str(fid)).name}_results.parquet")
-            duckdb_path = str(work / f"{Path(str(fid)).name}_results.duckdb")
-            sink = _ResultsSink(parquet_path, duckdb_path)
+            sink = _ResultsSink(parquet_path)
 
             # Run predict strictly one key per call and record results
             for si, seed in enumerate(seeds):
@@ -539,6 +509,13 @@ class SamuraiULRModel:
                     frames_dir, width, height, seed, si, str(fid), str(item.get("name") or ""), sink
                 )
             sink.close()
+
+            # Record artifact paths for upload by the caller
+            results_artifacts.append({
+                "file_id": str(fid),
+                "name": str(item.get("name") or ""),
+                "parquet": parquet_path,
+            })
 
             # Plotting: read saved results and overlay per-frame bboxes
             out_path = str(work / f"{Path(str(fid)).name}_tracked.mp4")
@@ -566,7 +543,7 @@ class SamuraiULRModel:
                 pass
 
         if not per_file_outputs:
-            return {"output_path": None, "labels": [], "schema_json_path": schema_json_path}
+            return {"output_path": None, "labels": [], "schema_json_path": schema_json_path, "results_artifacts": results_artifacts}
 
         # concat per-file outputs if more than one
         if len(per_file_outputs) > 1:
@@ -575,4 +552,4 @@ class SamuraiULRModel:
         else:
             final_path = per_file_outputs[0]
 
-        return {"output_path": final_path, "labels": sorted(set(per_file_labels)), "schema_json_path": schema_json_path}
+        return {"output_path": final_path, "labels": sorted(set(per_file_labels)), "schema_json_path": schema_json_path, "results_artifacts": results_artifacts}

@@ -248,6 +248,7 @@ class MLInferenceRunner:
                     final_path = model_res.get("output_path")
                     labels = model_res.get("labels", []) or []
                     schema_json_path = model_res.get("schema_json_path")
+                    results_artifacts = model_res.get("results_artifacts", []) or []
                     if not final_path:
                         continue
 
@@ -313,6 +314,39 @@ class MLInferenceRunner:
                     except Exception as _e:
                         # Fail schema upload softly without failing the whole job
                         print(f"Schema JSON upload/insert skipped due to error: {_e}")
+
+                    # Upload per-file results artifacts (Parquet only)
+                    for art in results_artifacts:
+                        try:
+                            fid = str(art.get("file_id"))
+                            file_leaf = rid_leaf(fid)
+                            # Parquet
+                            pq_path = art.get("parquet")
+                            if pq_path and os.path.exists(pq_path):
+                                pq_key = f"inference/{rid_leaf(job_id)}/group_{gi:03d}/{file_leaf}_results.parquet"
+                                up_pq = self.uploader.upload_file_as(pq_path, pq_key)
+                                if up_pq.status == S3Info.SUCCESS:
+                                    size_pq = Path(pq_path).stat().st_size
+                                    insert_inference_result(
+                                        self.db_manager,
+                                        job_id=job_id,
+                                        dataset=dataset,
+                                        files=[fid],
+                                        key=pq_key,
+                                        bucket=self.uploader.bucket,
+                                        size=size_pq,
+                                        labels=[],
+                                        meta={
+                                            "groupIndex": gi,
+                                            "sourceFiles": [fid],
+                                            "artifact": "results_parquet",
+                                            "contentType": "application/x-parquet",
+                                        },
+                                    )
+                                else:
+                                    print(f"Parquet upload failed for {pq_path}: {up_pq.error}")
+                        except Exception as _e:
+                            print(f"Artifact upload/insert skipped due to error: {_e}")
 
                 # All groups done -> mark job completed
                 ml_inference_job_query.set_inference_job_status(self.db_manager, job_id, "Completed")

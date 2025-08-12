@@ -120,7 +120,6 @@ RUN pip install \
     lmdb \
     pandas \
     pyarrow \
-    duckdb \
     scipy \
     loguru \
     flake8 \
