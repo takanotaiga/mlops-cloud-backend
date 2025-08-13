@@ -437,7 +437,10 @@ def _plot_from_parquet(frames_dir: str, results_parquet: str, *,
 
 from pathlib import Path
 from query.annotation_query import get_key_bboxes_for_file
-from backend_module.encoder import concat_videos
+from backend_module.encoder import concat_videos, timelapse_merge
+from ml_module.rtdetr_trainer import train_rtdetr
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import shutil
 
 
 class SamuraiULRModel:
@@ -458,6 +461,7 @@ class SamuraiULRModel:
         per_file_outputs: List[str] = []
         per_file_labels: List[str] = []
         results_artifacts: List[Dict[str, str]] = []
+        group_parquet_paths: List[str] = []
         schema_json_path = str(work / "samurai_ulr_schema.json")
         # Write schema JSON once per group
         try:
@@ -471,8 +475,14 @@ class SamuraiULRModel:
             segs = item.get("segments") or []
             if not segs:
                 continue
-            merged = str(work / f"{Path(str(fid)).name}_merged.mp4")
-            concat_videos(segs, merged)
+            # 1) Timelapse each segment in parallel and merge to keep <= 27000 frames
+            merged = str(work / f"{Path(str(fid)).name}_merged_timelapse.mp4")
+            try:
+                _merged_path, _step = timelapse_merge(segs, merged, max_frames=27000, max_workers=4)
+            except Exception as e:
+                # If timelapse fails, fall back to simple concat (may still fail due to frame cap)
+                merged = str(work / f"{Path(str(fid)).name}_merged.mp4")
+                concat_videos(segs, merged)
 
             # fetch seed boxes from annotations for this file
             anns = get_key_bboxes_for_file(db_manager, fid)
@@ -490,7 +500,7 @@ class SamuraiULRModel:
                 # if no seeds, skip this file
                 continue
 
-            # Extract frames once for this file
+            # Extract frames once for this file (from timelapse-merged video)
             frames_dir = str(work / f"{Path(str(fid)).name}_frames")
             _ensure_dir(frames_dir)
             # Pre-check total frames; reject >= 27000
@@ -499,7 +509,7 @@ class SamuraiULRModel:
                 raise ValueError(f"Video {merged} has {total_fc} frames (>=27000); rejecting before inference.")
             frame_count, width, height, fps = _extract_frames(merged, frames_dir)
 
-            # Prepare results sink (Parquet + DuckDB) for this file
+            # Prepare results sink (Parquet) for this file
             parquet_path = str(work / f"{Path(str(fid)).name}_results.parquet")
             sink = _ResultsSink(parquet_path)
 
@@ -526,21 +536,245 @@ class SamuraiULRModel:
             per_file_outputs.append(out_path)
             per_file_labels.extend([s.label for s in seeds])
 
-            # Cleanup masks and frames for this file (best-effort)
+            # 2) YOLO dataset export from SAM2 results (timelapse frames + parquet)
             try:
-                # cleanup frames
-                for f in os.listdir(frames_dir):
-                    if f.endswith('.jpg'):
-                        try:
-                            os.remove(os.path.join(frames_dir, f))
-                        except Exception:
-                            pass
+                dataset_root = Path(work) / f"yolo_dataset_{Path(str(fid)).name}"
+                images_train = dataset_root / "images" / "train"
+                images_val = dataset_root / "images" / "val"
+                images_test = dataset_root / "images" / "test"
+                labels_train = dataset_root / "labels" / "train"
+                labels_val = dataset_root / "labels" / "val"
+                labels_test = dataset_root / "labels" / "test"
+                for p in (images_train, images_val, images_test, labels_train, labels_val, labels_test):
+                    p.mkdir(parents=True, exist_ok=True)
+
+                df = pd.read_parquet(parquet_path)
+                # Map labels to class ids
+                label_names = sorted(df["label"].dropna().unique().tolist()) or sorted(set([s.label for s in seeds]))
+                cls_map = {name: i for i, name in enumerate(label_names)}
+                # Per-frame grouping to write one label file per image
+                g = df.groupby("frame_index")
+                import random
+                # Deterministic random split based on file id
+                seed_val = abs(hash(str(fid))) % (2**32)
+                rnd = random.Random(seed_val)
+                assigned_train = 0
+                assigned_val = 0
+                assigned_test = 0
+                frames_train: list[int] = []
+                frames_val: list[int] = []
+                frames_test: list[int] = []
+                frame_indices_present: list[int] = []
+                for fi in range(frame_count):
+                    frame_file = os.path.join(frames_dir, f"{fi + 1:08d}.jpg")
+                    if not os.path.exists(frame_file):
+                        continue
+                    frame_indices_present.append(fi)
+                    # Split 80/10/10 train:val:test
+                    r = rnd.random()
+                    if r < 0.8:
+                        split = "train"
+                        img_dir, lbl_dir = images_train, labels_train
+                    elif r < 0.9:
+                        split = "val"
+                        img_dir, lbl_dir = images_val, labels_val
+                    else:
+                        split = "test"
+                        img_dir, lbl_dir = images_test, labels_test
+                    # Copy image into dataset images
+                    out_img = img_dir / f"{fi + 1:08d}.jpg"
+                    shutil.copy2(frame_file, out_img)
+                    # Write YOLO label .txt
+                    out_lbl = lbl_dir / f"{fi + 1:08d}.txt"
+                    rows = []
+                    try:
+                        gg = g.get_group(fi)
+                        for _, r in gg.iterrows():
+                            if int(r.get("w", 0)) <= 0 or int(r.get("h", 0)) <= 0:
+                                continue
+                            xc = (int(r["x"]) + int(r["w"]) / 2.0) / float(width)
+                            yc = (int(r["y"]) + int(r["h"]) / 2.0) / float(height)
+                            nw = int(r["w"]) / float(width)
+                            nh = int(r["h"]) / float(height)
+                            cname = str(r["label"]) if not pd.isna(r["label"]) else seeds[0].label
+                            cid = cls_map.get(cname, 0)
+                            rows.append(f"{cid} {xc:.6f} {yc:.6f} {nw:.6f} {nh:.6f}")
+                    except Exception:
+                        pass
+                    with open(out_lbl, "w", encoding="utf-8") as f:
+                        if rows:
+                            f.write("\n".join(rows))
+                        else:
+                            f.write("")  # empty file to indicate no objects
+                    if split == "train":
+                        assigned_train += 1
+                        frames_train.append(fi)
+                    elif split == "val":
+                        assigned_val += 1
+                        frames_val.append(fi)
+                    else:
+                        assigned_test += 1
+                        frames_test.append(fi)
+
+                # Ensure both splits have at least one sample if possible
                 try:
-                    os.rmdir(frames_dir)
+                    def _move_one(src_split: str, dst_split: str, idx: int):
+                        if src_split == "train":
+                            s_img, s_lbl = images_train, labels_train
+                        elif src_split == "val":
+                            s_img, s_lbl = images_val, labels_val
+                        else:
+                            s_img, s_lbl = images_test, labels_test
+                        if dst_split == "train":
+                            d_img, d_lbl = images_train, labels_train
+                        elif dst_split == "val":
+                            d_img, d_lbl = images_val, labels_val
+                        else:
+                            d_img, d_lbl = images_test, labels_test
+                        img = s_img / f"{idx + 1:08d}.jpg"
+                        lbl = s_lbl / f"{idx + 1:08d}.txt"
+                        if img.exists():
+                            shutil.move(str(img), str(d_img / img.name))
+                        if lbl.exists():
+                            shutil.move(str(lbl), str(d_lbl / lbl.name))
+
+                    # Ensure each split has at least one sample if possible
+                    if assigned_train == 0:
+                        src = frames_val if len(frames_val) > 1 else (frames_test if len(frames_test) > 1 else [])
+                        if src:
+                            idx = src[-1]
+                            _move_one("val" if src is frames_val else "test", "train", idx)
+                            assigned_train += 1
+                            if src is frames_val:
+                                assigned_val -= 1
+                            else:
+                                assigned_test -= 1
+                    if assigned_val == 0:
+                        src = frames_train if len(frames_train) > 1 else (frames_test if len(frames_test) > 1 else [])
+                        if src:
+                            idx = src[-1]
+                            _move_one("train" if src is frames_train else "test", "val", idx)
+                            assigned_val += 1
+                            if src is frames_train:
+                                assigned_train -= 1
+                            else:
+                                assigned_test -= 1
+                    if assigned_test == 0:
+                        src = frames_train if len(frames_train) > 1 else (frames_val if len(frames_val) > 1 else [])
+                        if src:
+                            idx = src[-1]
+                            _move_one("train" if src is frames_train else "val", "test", idx)
+                            assigned_test += 1
+                            if src is frames_train:
+                                assigned_train -= 1
+                            else:
+                                assigned_val -= 1
                 except Exception:
                     pass
-            except Exception:
-                pass
+
+                # Minimal data.yaml
+                data_yaml = dataset_root / "data.yaml"
+                with open(data_yaml, "w", encoding="utf-8") as f:
+                    f.write(
+                        "\n".join([
+                            f"path: {dataset_root}",
+                            "train: images/train",
+                            "val: images/val",
+                            "test: images/test",
+                            f"names: {label_names}",
+                        ])
+                    )
+
+                # 3) Train RT-DETR and export TensorRT
+                train_out = Path(work) / f"train_result_{Path(str(fid)).name}"
+                train_res = train_rtdetr(str(dataset_root), str(train_out), epochs=2, imgsz=640,
+                                         base_model="rtdetr-l.pt", export_engine=True, export_int8=True)
+                # Pick an inference model path preference: engine > pt
+                model_path = train_res.get("engine") or train_res.get("pt")
+            except Exception as _e:
+                # If training fails, skip downstream inference
+                model_path = None
+
+            # 4) Inference on original segments in parallel -> per-segment parquet, then merge
+            def _infer_one(seg_path: str, seg_index: int) -> Optional[str]:
+                try:
+                    from ultralytics import RTDETR
+                    if not model_path:
+                        return None
+                    model = RTDETR(model_path)
+                    # Determine local frame count for global indexing
+                    cap = cv2.VideoCapture(seg_path)
+                    fc = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+                    cap.release()
+                    rows = []
+                    frame_counter = -1
+                    for results in model.predict(seg_path, stream=True, verbose=False):
+                        frame_counter += 1
+                        # results.boxes: per-frame detections
+                        for box_data in results.boxes:
+                            box = box_data.xywh[0]
+                            x = int(max(0, min(float(box[0]), 1e9)))
+                            y = int(max(0, min(float(box[1]), 1e9)))
+                            w_ = int(max(0, min(float(box[2]), 1e9)))
+                            h_ = int(max(0, min(float(box[3]), 1e9)))
+                            conf = float(box_data.conf)
+                            cls_id = int(box_data.cls)
+                            rows.append({
+                                "segment_index": seg_index,
+                                "frame_index_local": frame_counter,
+                                "x": x, "y": y, "w": w_, "h": h_,
+                                "conf": conf, "class_id": cls_id,
+                            })
+                    # write parquet for this segment
+                    pq_path = str(work / f"{Path(str(fid)).name}_seg{seg_index:03d}_infer.parquet")
+                    if rows:
+                        df_inf = pd.DataFrame(rows)
+                        df_inf.to_parquet(pq_path, index=False)
+                        return pq_path
+                    else:
+                        # write empty parquet with schema
+                        df_inf = pd.DataFrame(rows, columns=["segment_index", "frame_index_local", "x", "y", "w", "h", "conf", "class_id"])  # type: ignore
+                        df_inf.to_parquet(pq_path, index=False)
+                        return pq_path
+                except Exception:
+                    return None
+
+            seg_paths = list(segs)
+            seg_pq_paths: List[str] = []
+            if model_path and seg_paths:
+                with ThreadPoolExecutor(max_workers=2) as ex:
+                    futs = [ex.submit(_infer_one, sp, si) for si, sp in enumerate(seg_paths)]
+                    for fu in as_completed(futs):
+                        p = fu.result()
+                        if p:
+                            seg_pq_paths.append(p)
+
+            # Merge segment parquets into group-level parquet for this file
+            if seg_pq_paths:
+                try:
+                    dfs = [pd.read_parquet(p) for p in seg_pq_paths]
+                    df_all = pd.concat(dfs, ignore_index=True)
+                    group_pq = str(work / f"{Path(str(fid)).name}_infer_merged.parquet")
+                    df_all.to_parquet(group_pq, index=False)
+                    group_parquet_paths.append(group_pq)
+                except Exception:
+                    pass
+
+            # Cleanup masks and frames for this file (best-effort)
+            # try:
+            #     # cleanup frames
+            #     for f in os.listdir(frames_dir):
+            #         if f.endswith('.jpg'):
+            #             try:
+            #                 os.remove(os.path.join(frames_dir, f))
+            #             except Exception:
+            #                 pass
+            #     try:
+            #         # os.rmdir(frames_dir)
+            #     except Exception:
+            #         pass
+            # except Exception:
+            #     pass
 
         if not per_file_outputs:
             return {"output_path": None, "labels": [], "schema_json_path": schema_json_path, "results_artifacts": results_artifacts}
@@ -552,4 +786,13 @@ class SamuraiULRModel:
         else:
             final_path = per_file_outputs[0]
 
-        return {"output_path": final_path, "labels": sorted(set(per_file_labels)), "schema_json_path": schema_json_path, "results_artifacts": results_artifacts}
+        # If any group parquet exists, select the first for upload at group level
+        group_parquet = group_parquet_paths[0] if group_parquet_paths else None
+
+        return {
+            "output_path": final_path,
+            "labels": sorted(set(per_file_labels)),
+            "schema_json_path": schema_json_path,
+            "results_artifacts": results_artifacts,
+            "group_parquet": group_parquet,
+        }

@@ -311,6 +311,31 @@ class MLInferenceRunner:
                                     "contentType": "application/json",
                                 },
                             )
+                        # Upload overall inference parquet if provided by model
+                        group_parquet = model_res.get("group_parquet")
+                        if group_parquet and os.path.exists(group_parquet):
+                            gp_key = f"inference/{rid_leaf(job_id)}/group_{gi:03d}/overall_results.parquet"
+                            up_gp = self.uploader.upload_file_as(group_parquet, gp_key)
+                            if up_gp.status == S3Info.SUCCESS:
+                                size_gp = Path(group_parquet).stat().st_size
+                                insert_inference_result(
+                                    self.db_manager,
+                                    job_id=job_id,
+                                    dataset=dataset,
+                                    files=file_ids_in_group,
+                                    key=gp_key,
+                                    bucket=self.uploader.bucket,
+                                    size=size_gp,
+                                    labels=[],
+                                    meta={
+                                        "groupIndex": gi,
+                                        "sourceFiles": file_ids_in_group,
+                                        "artifact": "overall_results_parquet",
+                                        "contentType": "application/x-parquet",
+                                    },
+                                )
+                            else:
+                                print(f"Overall parquet upload failed: {up_gp.error}")
                     except Exception as _e:
                         # Fail schema upload softly without failing the whole job
                         print(f"Schema JSON upload/insert skipped due to error: {_e}")
@@ -361,7 +386,7 @@ class MLInferenceRunner:
                     if work_dir.exists() and not self.keep_work_dir:
                         # Best-effort cleanup
                         import shutil
-                        shutil.rmtree(work_dir, ignore_errors=True)
+                        # shutil.rmtree(work_dir, ignore_errors=True)
                 except Exception:
                     pass
 

@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 from dataclasses import dataclass
 from backend_module.uuid_tools import get_uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 class EncodeError(Exception):
@@ -408,3 +409,122 @@ def concat_videos(inputs: List[str], output_path: str) -> str:
             "ffmpeg concat failed\n" + (proc.stderr[-300:] if proc.stderr else "")
         )
     return str(out.resolve())
+
+
+# ---------------- Timelapse utilities ----------------
+
+def _approx_total_frames_by_probe(path: str) -> Optional[int]:
+    """Approximate total frames using ffprobe metadata.
+
+    Uses duration * fps when possible, falling back to None when unknown.
+    """
+    try:
+        meta = probe_video(path)
+        dur = meta.get("durationSec")
+        afr = meta.get("avg_frame_rate")
+        fps = _parse_fps(afr) if afr else None
+        if dur is not None and fps is not None:
+            # safety margin
+            return max(0, int(dur * fps + 0.5))
+        return None
+    except Exception:
+        return None
+
+
+def _make_timelapse_single(input_path: str, output_path: str, step: int) -> str:
+    """Create a timelapse by selecting every `step`-th frame and normalizing PTS.
+
+    Keeps visual smoothness by resetting PTS to match display at input FPS.
+    """
+    out = Path(output_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    # ffmpeg filter: select every Nth frame; reset PTS to consecutive frames
+    # Using vfr to allow frame dropping and let muxer write variable frame intervals; setpts normalizes timestamps
+    vf = f"select='not(mod(n,{step}))',setpts=N/FRAME_RATE/TB"
+    cmd = [
+        "ffmpeg", "-y", "-nostdin",
+        "-i", str(input_path),
+        "-vf", vf,
+        "-an",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
+        str(out),
+    ]
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if proc.returncode != 0 or not out.exists():
+        raise EncodeError("ffmpeg timelapse failed\n" + (proc.stderr[-300:] if proc.stderr else ""))
+    return str(out.resolve())
+
+
+def timelapse_merge(segments: List[str], merged_out: str, *, max_frames: int = 27000, max_workers: int = 4) -> Tuple[str, int]:
+    """
+    Create per-segment timelapse videos in parallel and merge them into one.
+
+    - Computes a global decimation step so that the approximate total frames across
+      all segments is <= max_frames.
+    - Runs per-segment timelapse encoding concurrently.
+    - Concatenates the timelapsed segments losslessly.
+
+    Returns: (merged_timelapse_path, step)
+    """
+    if not segments:
+        raise ValueError("No segments provided for timelapse_merge")
+
+    # Estimate total frames across all segments
+    approx_frames: int = 0
+    unknown = False
+    for s in segments:
+        n = _approx_total_frames_by_probe(s)
+        if n is None:
+            unknown = True
+            break
+        approx_frames += n
+
+    if unknown or approx_frames <= 0:
+        # Fallback: assume 30fps and use duration by ffprobe format when available
+        approx_frames = 0
+        for s in segments:
+            try:
+                meta = probe_video(s)
+                dur = meta.get("durationSec") or 0.0
+                fps = _parse_fps(meta.get("avg_frame_rate")) or 30.0
+                approx_frames += int(dur * fps + 0.5)
+            except Exception:
+                # Worst case: assume 30fps * 180s (~5400 frames) per segment
+                approx_frames += 5400
+
+    step = max(1, (approx_frames + max_frames - 1) // max_frames)
+
+    # Timelapse each segment concurrently
+    tmp_dir = Path(Path(merged_out).parent or ".") / f"tl_{get_uuid(8)}"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+
+    args_list = []
+    out_paths: List[str] = []
+    for i, seg in enumerate(segments):
+        out_path = str(tmp_dir / f"tl_{i:03d}.mp4")
+        out_paths.append(out_path)
+        args_list.append((seg, out_path, step))
+
+    def _worker(a):
+        return _make_timelapse_single(*a)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = [ex.submit(_worker, a) for a in args_list]
+        for _ in as_completed(futures):
+            pass
+
+    # Merge timelapsed segments
+    merged_path = concat_videos(out_paths, merged_out)
+
+    # Best-effort cleanup of temp timelapse parts
+    try:
+        for p in out_paths:
+            try:
+                Path(p).unlink(missing_ok=True)
+            except Exception:
+                pass
+        tmp_dir.rmdir()
+    except Exception:
+        pass
+
+    return merged_path, step
