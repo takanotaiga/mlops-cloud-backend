@@ -10,11 +10,12 @@ from query import ml_inference_job_query
 from query.encoded_segment_query import get_segments_with_file_by_keys
 from query.utils import extract_results, rid_leaf
 from query.inference_result_query import insert_inference_result
-from ml_module.registry import get_model
 from backend_module.encoder import transcode_video
 import mimetypes
 from collections import defaultdict
 import re
+import json
+import subprocess
 
 def _get_env(name: str, default: Optional[str] = None, *, required: bool = False) -> str:
     """Read an environment variable with optional default and required flag."""
@@ -92,13 +93,19 @@ class MLInferenceRunner:
             task_type = job.get("taskType")
             model = job.get("model")
             model_source = job.get("modelSource")
+            job_options = job.get("options") or {}
+            # options may be JSON string; try to decode
+            if isinstance(job_options, str):
+                try:
+                    job_options = json.loads(job_options)
+                except Exception:
+                    job_options = {}
             linked_file = ml_inference_job_query.get_linked_file(self.db_manager, job_id)
-            # Select model adapter based on job
-            if not job_id or not task_type or len(linked_file) == 0:
+            # Basic guard
+            if not job_id or not task_type:
                 return
-            model_adapter = get_model(model, model_source, task_type)
-            if model_adapter is None:
-                return
+            # NOTE: We no longer import or call ml_module directly here.
+            # All model execution must happen in a separate Python process.
 
             # Update status to running
             try:
@@ -109,6 +116,177 @@ class MLInferenceRunner:
             # Prepare a per-job working directory
             work_dir = Path("work_infer") / str(job_id).split(":")[-1]
             try:
+                # Fast path for job types that fully specify inputs via options
+                if task_type in ("train-rtdetr", "export-trt", "infer-rtdetr"):
+                    # Branch per task
+                    if task_type == "train-rtdetr":
+                        dataset_path = job_options.get("datasetPath")
+                        if not dataset_path:
+                            raise ValueError("train-rtdetr requires options.datasetPath")
+                        out_dir = str(work_dir / "train_out")
+                        res_json = work_dir / "train_result.json"
+                        cmd = [
+                            "python3", "-m", "ml_module.cli_train_rtdetr",
+                            "--dataset", dataset_path,
+                            "--out-dir", out_dir,
+                            "--epochs", str(job_options.get("epochs", 2)),
+                            "--imgsz", str(job_options.get("imgsz", 640)),
+                            "--base-model", str(job_options.get("baseModel", "rtdetr-l.pt")),
+                        ]
+                        if bool(job_options.get("exportEngine", True)):
+                            cmd.append("--export-engine")
+                        if bool(job_options.get("exportInt8", True)):
+                            cmd.append("--export-int8")
+                        cmd += ["--result", str(res_json)]
+                        subprocess.run(cmd, check=True)
+                        with open(res_json, "r", encoding="utf-8") as f:
+                            tres = json.load(f)
+                        # Upload produced artifacts if present
+                        for k, art_type in (("engine", "model_engine"), ("pt", "model_pt"), ("onnx", "model_onnx")):
+                            p = tres.get(k)
+                            if p and os.path.exists(p):
+                                key = f"models/{rid_leaf(job_id)}/{os.path.basename(p)}"
+                                up = self.uploader.upload_file_as(p, key)
+                                if up.status == S3Info.SUCCESS:
+                                    size = Path(p).stat().st_size
+                                    insert_inference_result(
+                                        self.db_manager,
+                                        job_id=job_id,
+                                        dataset=None,
+                                        files=[],
+                                        key=key,
+                                        bucket=self.uploader.bucket,
+                                        size=size,
+                                        labels=[],
+                                        meta={"artifact": art_type},
+                                    )
+                                else:
+                                    print(f"Upload failed for artifact {p}: {up.error}")
+
+                    elif task_type == "export-trt":
+                        weights_path = job_options.get("weightsPath")
+                        weights_key = job_options.get("weightsKey")
+                        if not weights_path and weights_key:
+                            dl = self.uploader.download_file(weights_key, work_dir)
+                            if dl.status != S3Info.SUCCESS or not dl.local_path:
+                                raise RuntimeError(f"Failed to download weights: {dl.error}")
+                            weights_path = dl.local_path
+                        if not weights_path:
+                            raise ValueError("export-trt requires options.weightsPath or options.weightsKey")
+                        data_yaml = job_options.get("dataYamlPath")
+                        res_json = work_dir / "export_result.json"
+                        cmd = [
+                            "python3", "-m", "ml_module.cli_export_trt",
+                            "--weights", str(weights_path),
+                            "--result", str(res_json),
+                        ]
+                        if data_yaml:
+                            cmd += ["--data-yaml", str(data_yaml)]
+                        if bool(job_options.get("int8", True)):
+                            cmd.append("--int8")
+                        subprocess.run(cmd, check=True)
+                        with open(res_json, "r", encoding="utf-8") as f:
+                            eres = json.load(f)
+                        for k, art_type in (("engine", "model_engine"), ("onnx", "model_onnx")):
+                            p = eres.get(k)
+                            if p and os.path.exists(p):
+                                key = f"models/{rid_leaf(job_id)}/{os.path.basename(p)}"
+                                up = self.uploader.upload_file_as(p, key)
+                                if up.status == S3Info.SUCCESS:
+                                    size = Path(p).stat().st_size
+                                    insert_inference_result(
+                                        self.db_manager,
+                                        job_id=job_id,
+                                        dataset=None,
+                                        files=[],
+                                        key=key,
+                                        bucket=self.uploader.bucket,
+                                        size=size,
+                                        labels=[],
+                                        meta={"artifact": art_type},
+                                    )
+                        # Done for export job
+                        ml_inference_job_query.set_inference_job_status(self.db_manager, job_id, "Completed")
+                        return
+
+                    elif task_type == "infer-rtdetr":
+                        model_path = job_options.get("modelPath")
+                        model_key = job_options.get("modelKey")
+                        if not model_path and model_key:
+                            dl = self.uploader.download_file(model_key, work_dir)
+                            if dl.status != S3Info.SUCCESS or not dl.local_path:
+                                raise RuntimeError(f"Failed to download model: {dl.error}")
+                            model_path = dl.local_path
+                        if not model_path:
+                            raise ValueError("infer-rtdetr requires options.modelPath or options.modelKey")
+                        video_keys = job_options.get("videoKeys") or ([] if job_options.get("videoKey") is None else [job_options.get("videoKey")])
+                        if not video_keys:
+                            raise ValueError("infer-rtdetr requires options.videoKeys or options.videoKey")
+                        # Download videos
+                        dlr = self.uploader.download_files(keys=video_keys, dest_dir=work_dir)
+                        key_to_local = {r.key: r.local_path for r in dlr if r.status == S3Info.SUCCESS and r.local_path}
+                        make_overlay = bool(job_options.get("makeOverlay", True))
+                        conf = float(job_options.get("conf", 0.25))
+                        imgsz = int(job_options.get("imgsz", 640))
+                        gi = 0
+                        for vkey, vpath in key_to_local.items():
+                            gi += 1
+                            out_parquet = work_dir / f"video_{gi:03d}.parquet"
+                            out_video = (work_dir / f"video_{gi:03d}_overlay.mp4") if make_overlay else None
+                            res_json = work_dir / f"infer_result_{gi:03d}.json"
+                            cmd = [
+                                "python3", "-m", "ml_module.cli_infer_rtdetr",
+                                "--model", str(model_path),
+                                "--video", str(vpath),
+                                "--out-parquet", str(out_parquet),
+                                "--result", str(res_json),
+                                "--conf", str(conf),
+                                "--imgsz", str(imgsz),
+                            ]
+                            if out_video is not None:
+                                cmd += ["--out-video", str(out_video)]
+                            subprocess.run(cmd, check=True)
+                            with open(res_json, "r", encoding="utf-8") as f:
+                                ires = json.load(f)
+                            # Upload artifacts
+                            if os.path.exists(out_parquet):
+                                pq_key = f"inference/{rid_leaf(job_id)}/{os.path.basename(vkey)}.parquet"
+                                up = self.uploader.upload_file_as(str(out_parquet), pq_key)
+                                if up.status == S3Info.SUCCESS:
+                                    size = Path(out_parquet).stat().st_size
+                                    insert_inference_result(
+                                        self.db_manager,
+                                        job_id=job_id,
+                                        dataset=None,
+                                        files=[],
+                                        key=pq_key,
+                                        bucket=self.uploader.bucket,
+                                        size=size,
+                                        labels=[],
+                                        meta={"artifact": "results_parquet", "sourceKey": vkey},
+                                    )
+                            if out_video is not None and os.path.exists(out_video):
+                                mp4_key = f"inference/{rid_leaf(job_id)}/{os.path.basename(vkey)}_overlay.mp4"
+                                up2 = self.uploader.upload_file_as(str(out_video), mp4_key)
+                                if up2.status == S3Info.SUCCESS:
+                                    size2 = Path(out_video).stat().st_size
+                                    insert_inference_result(
+                                        self.db_manager,
+                                        job_id=job_id,
+                                        dataset=None,
+                                        files=[],
+                                        key=mp4_key,
+                                        bucket=self.uploader.bucket,
+                                        size=size2,
+                                        labels=[],
+                                        meta={"artifact": "plot_video", "sourceKey": vkey},
+                                    )
+
+                        # Done for inference job
+                        ml_inference_job_query.set_inference_job_status(self.db_manager, job_id, "Completed")
+                        return
+
+                # Default path: download linked files and run group-oriented pipeline
                 download_result = self.uploader.download_files(
                     keys=linked_file,
                     dest_dir=work_dir
@@ -244,11 +422,52 @@ class MLInferenceRunner:
                     if not model_group:
                         continue
 
-                    model_res = model_adapter.process_group(self.db_manager, model_group, str(work_gdir))
+                    # Prepare input spec for external CLI and run it
+                    cli_in = {
+                        "jobId": str(job_id),
+                        "taskType": task_type,
+                        "model": model,
+                        "modelSource": model_source,
+                        "group": model_group,
+                        # Optional: include DB connection info if the script needs it in the future
+                        # Currently not used by the CLI runner.
+                    }
+                    in_path = work_gdir / "input.json"
+                    out_path_json = work_gdir / "result.json"
+                    with open(in_path, "w", encoding="utf-8") as f:
+                        json.dump(cli_in, f, ensure_ascii=False)
+
+                    cmd = [
+                        "python3",
+                        "-m",
+                        "ml_module.cli_run_group",
+                        "--input",
+                        str(in_path),
+                        "--work-dir",
+                        str(work_gdir),
+                        "--result",
+                        str(out_path_json),
+                    ]
+                    try:
+                        completed = subprocess.run(cmd, check=True, capture_output=True, text=True)
+                    except subprocess.CalledProcessError as cpe:
+                        print("External ML process failed:")
+                        print(cpe.stdout)
+                        print(cpe.stderr)
+                        raise
+
+                    try:
+                        with open(out_path_json, "r", encoding="utf-8") as f:
+                            model_res = json.load(f)
+                    except Exception as e:
+                        raise RuntimeError(f"Failed to read model result JSON: {e}")
+
                     final_path = model_res.get("output_path")
                     labels = model_res.get("labels", []) or []
                     schema_json_path = model_res.get("schema_json_path")
                     results_artifacts = model_res.get("results_artifacts", []) or []
+                    # Optional overall Parquet path for the whole group
+                    group_parquet = model_res.get("group_parquet")
                     if not final_path:
                         continue
 
@@ -312,7 +531,6 @@ class MLInferenceRunner:
                                 },
                             )
                         # Upload overall inference parquet if provided by model
-                        group_parquet = model_res.get("group_parquet")
                         if group_parquet and os.path.exists(group_parquet):
                             gp_key = f"inference/{rid_leaf(job_id)}/group_{gi:03d}/overall_results.parquet"
                             up_gp = self.uploader.upload_file_as(group_parquet, gp_key)
