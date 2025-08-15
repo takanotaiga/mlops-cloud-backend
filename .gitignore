@@ -1,7 +1,11 @@
 .venv
 __pycache__
 work
-*.mp4
 work_infer
 work_thumb
 *.pt
+*.mp4
+*.jpg
+*.jpeg
+*.json
+*.parquet
