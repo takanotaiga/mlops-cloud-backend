@@ -328,9 +328,6 @@ class MLInferenceRunner:
                         "index": (meta.get("index") if isinstance(meta, dict) else None)
                     })
 
-                    print(meta.get("index") if isinstance(meta, dict) else None)
-                    print(meta.get("index"))
-
                 # Sort segments within each file by numeric meta.index,
                 # with a robust fallback to the local filename pattern out_###.
                 def _seg_sort_key(seg: dict):
