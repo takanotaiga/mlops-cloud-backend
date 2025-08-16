@@ -1,4 +1,4 @@
-FROM nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
+FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
 
 WORKDIR /workspace
 
@@ -55,7 +55,6 @@ RUN git clone --branch n12.2.72.0 --depth 1 https://git.videolan.org/git/ffmpeg/
 
 RUN cd nv-codec-headers && \
     make install
-
 
 RUN  cd ffmpeg && \
   ./configure \
@@ -132,7 +131,6 @@ RUN pip install \
     ffmpeg-python==0.2.0 \
     gdown==5.2 \
     lapx==0.5.10 \
-    fastapi==0.115.13 \
     uvicorn==0.34.3 \
     requests==2.32.3 \
     surrealdb==1.0.4 \

@@ -285,11 +285,13 @@ class SamuraiULRModel:
                 except Exception:
                     pass
 
-            # Record artifact paths for upload by the caller
+        # Record artifact paths for upload by the caller
             results_artifacts.append({
                 "file_id": str(fid),
                 "name": str(item.get("name") or ""),
                 "parquet": parquet_path,
+                # Description to be propagated to DB metadata
+                "description": "各ファイルのSAM2推論結果 (Parquet)",
             })
 
             # Plotting: read saved results and overlay per-frame bboxes
@@ -410,7 +412,7 @@ class SamuraiULRModel:
                     # Pass absolute path under /workspace/src/datasets
                     "--dataset", str(dataset_root),
                     "--out-dir", str(train_out),
-                    "--epochs", str(32),
+                    "--epochs", str(8),
                     "--base-model", "rtdetr-l.pt",
                     "--result", str(train_json),
                 ])
@@ -529,4 +531,8 @@ class SamuraiULRModel:
             "results_artifacts": results_artifacts,
             "group_parquet": group_parquet,
             "temp_datasets": sorted(set(temp_datasets)),
+            # Human-readable descriptions propagated to uploader
+            "video_description": "タイムラプス動画にSAM2の推論結果をプロットした動画です。",
+            "schema_description": "SAM2推論結果のスキーマ定義 (JSON)。",
+            "group_parquet_description": "グループ全体のSAM2推論結果 (Parquet)。",
         }

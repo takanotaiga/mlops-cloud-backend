@@ -350,11 +350,17 @@ class MLInferenceRunner:
                     schema_json_path = None
                     results_artifacts = None
                     group_parquet = None
+                    video_description = None
+                    schema_description = None
+                    group_parquet_description = None
                     if isinstance(res, dict):
                         out_path = res.get("output_path")
                         schema_json_path = res.get("schema_json_path")
                         results_artifacts = res.get("results_artifacts")
                         group_parquet = res.get("group_parquet")
+                        video_description = res.get("video_description")
+                        schema_description = res.get("schema_description")
+                        group_parquet_description = res.get("group_parquet_description")
                         try:
                             for p in (res.get("temp_datasets") or []):
                                 if isinstance(p, str) and p:
@@ -377,6 +383,9 @@ class MLInferenceRunner:
                         "schema_json_path": schema_json_path,
                         "results_artifacts": results_artifacts,
                         "group_parquet": group_parquet,
+                        "video_description": video_description,
+                        "schema_description": schema_description,
+                        "group_parquet_description": group_parquet_description,
                     })
 
                 # 2) Postprocess all result videos (e.g., transcode)
@@ -397,8 +406,11 @@ class MLInferenceRunner:
                             dataset=ctx["dataset"],
                             file_ids=ctx["file_ids"],
                             video_path=vp,
+                            video_description=ctx.get("video_description"),
                             schema_json_path=ctx.get("schema_json_path"),
+                            schema_description=ctx.get("schema_description"),
                             group_parquet=ctx.get("group_parquet"),
+                            group_parquet_description=ctx.get("group_parquet_description"),
                             results_artifacts=ctx.get("results_artifacts") or [],
                         )
                     )
