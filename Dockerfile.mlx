@@ -145,3 +145,12 @@ RUN git clone -b master --single-branch --depth=1 https://github.com/moriyalab/s
 RUN cd /workspace/samurai/sam2/checkpoints && \
     ./download_ckpts.sh && \
     cd ..
+
+# Copy application sources from build context
+WORKDIR /workspace/src
+COPY ml_inference_manager.py /workspace/src/
+COPY query /workspace/src/query
+COPY backend_module /workspace/src/backend_module
+COPY ml_module /workspace/src/ml_module
+
+CMD ["python3", "ml_inference_manager.py"]

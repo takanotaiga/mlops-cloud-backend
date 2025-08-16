@@ -114,9 +114,16 @@ RUN apt-get autoremove -y \
 
 RUN python3 -m pip install -U pip && \
     python3 -m pip install -U \
-    fastapi==0.115.13 \
     uvicorn==0.34.3 \
     requests==2.32.3 \
     surrealdb==1.0.4 \
     boto3==1.38.44 \
     python-multipart
+
+# Copy application sources from build context
+WORKDIR /workspace/src
+COPY video_manager.py /workspace/src/
+COPY query /workspace/src/query
+COPY backend_module /workspace/src/backend_module
+
+CMD ["python3", "video_manager.py"]
