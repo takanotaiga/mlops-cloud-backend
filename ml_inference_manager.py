@@ -9,13 +9,13 @@ from backend_module.object_storage import MinioS3Uploader, S3Info
 from backend_module.uuid_tools import get_uuid
 from query import ml_inference_job_query
 from query.encoded_segment_query import get_segments_with_file_by_keys
-from query.utils import extract_results, rid_leaf
+from query.utils import extract_results
  
 import mimetypes
 from collections import defaultdict
 import re
 import json
-import subprocess # note: /workspace/src/datasets 55432
+
 
 def _get_env(name: str, default: Optional[str] = None, *, required: bool = False) -> str:
     """Read an environment variable with optional default and required flag."""
@@ -333,6 +333,7 @@ class MLInferenceRunner:
                 # 1) Run inference per group and collect result paths
                 result_paths: list[str] = []
                 group_contexts: list[dict] = []
+                temp_datasets_to_cleanup: set[str] = set()
                 for gi, fg in enumerate(file_groups, start=1):
                     g_work_dir = work_dir / f"g_{gi:03d}"
                     g_work_dir.mkdir(parents=True, exist_ok=True)
@@ -354,6 +355,12 @@ class MLInferenceRunner:
                         schema_json_path = res.get("schema_json_path")
                         results_artifacts = res.get("results_artifacts")
                         group_parquet = res.get("group_parquet")
+                        try:
+                            for p in (res.get("temp_datasets") or []):
+                                if isinstance(p, str) and p:
+                                    temp_datasets_to_cleanup.add(p)
+                        except Exception:
+                            pass
                     elif isinstance(res, str):
                         out_path = res
                     if out_path:
@@ -417,9 +424,11 @@ class MLInferenceRunner:
             finally:
                 try:
                     if work_dir.exists() and not self.keep_work_dir:
-                        # Best-effort cleanup
+                        # Best-effort cleanup of workspace and any temp datasets
                         import shutil
-                        
+                        shutil.rmtree(work_dir, ignore_errors=True)
+                        for d in list(temp_datasets_to_cleanup):
+                            shutil.rmtree(d, ignore_errors=True)
                 except Exception:
                     pass
 
@@ -445,8 +454,6 @@ class MLInferenceRunner:
             # If a cycle took longer than the schedule, push the next tick
             if end_time - start_time > self.next_time:
                 self.next_time = end_time + self.interval
-
-            break
 
 
 if __name__ == "__main__":

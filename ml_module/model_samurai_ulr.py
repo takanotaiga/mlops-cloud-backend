@@ -55,8 +55,8 @@ def _extract_frames(video_path: str, out_dir: str) -> Tuple[int, int, int, float
                 break
             count += 1
             # Hard safety: abort if frame count threshold exceeded during extraction
-            if count >= 5000:
-                raise ValueError("Video has 5000 or more frames; aborting per policy.")
+            if count >= 16384:
+                raise ValueError("Video has 16384 or more frames; aborting per policy.")
             cv2.imwrite(osp.join(out_dir, f"{count:08d}.jpg"), frame, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
     finally:
         cap.release()
@@ -163,6 +163,7 @@ class SamuraiULRModel:
         per_file_labels: List[str] = []
         results_artifacts: List[Dict[str, str]] = []
         group_parquet_paths: List[str] = []
+        temp_datasets: List[str] = []
         schema_json_path = str(work / "samurai_ulr_schema.json")
         # Write schema JSON once per group
         try:
@@ -176,10 +177,10 @@ class SamuraiULRModel:
             segs = item.get("segments") or []
             if not segs:
                 continue
-            # 1) Timelapse each segment in parallel and merge to keep <= 5000 frames
+            # 1) Timelapse each segment in parallel and merge to keep <= 16384 frames
             merged = str(work / f"{Path(str(fid)).name}_merged_timelapse.mp4")
             try:
-                _merged_path, _step = timelapse_merge(segs, merged, max_frames=5000, max_workers=4)
+                _merged_path, _step = timelapse_merge(segs, merged, max_frames=16384, max_workers=4)
             except Exception as e:
                 # If timelapse fails, fall back to simple concat (may still fail due to frame cap)
                 merged = str(work / f"{Path(str(fid)).name}_merged.mp4")
@@ -204,10 +205,10 @@ class SamuraiULRModel:
             # Extract frames once for this file (from timelapse-merged video)
             frames_dir = str(work / f"{Path(str(fid)).name}_frames")
             _ensure_dir(frames_dir)
-            # Pre-check total frames; reject >= 5000
+            # Pre-check total frames; reject >= 16384
             total_fc = _get_total_frame_count(merged)
-            if total_fc >= 5000:
-                raise ValueError(f"Video {merged} has {total_fc} frames (>=5000); rejecting before inference.")
+            if total_fc >= 16384:
+                raise ValueError(f"Video {merged} has {total_fc} frames (>=16384); rejecting before inference.")
             frame_count, width, height, fps = _extract_frames(merged, frames_dir)
 
             # Run predict strictly one key per call using CLI and collect results
@@ -307,6 +308,10 @@ class SamuraiULRModel:
                 dataset_name = f"yolo_dataset_{Path(str(fid)).name}"
                 dataset_root = datasets_base / dataset_name
                 dataset_root.mkdir(parents=True, exist_ok=True)
+                try:
+                    temp_datasets.append(str(dataset_root))
+                except Exception:
+                    pass
                 images_train = dataset_root / "images" / "train"
                 images_val = dataset_root / "images" / "val"
                 images_test = dataset_root / "images" / "test"
@@ -405,7 +410,7 @@ class SamuraiULRModel:
                     # Pass absolute path under /workspace/src/datasets
                     "--dataset", str(dataset_root),
                     "--out-dir", str(train_out),
-                    "--epochs", str(2),
+                    "--epochs", str(32),
                     "--base-model", "rtdetr-l.pt",
                     "--result", str(train_json),
                 ])
@@ -504,22 +509,6 @@ class SamuraiULRModel:
                 except Exception:
                     pass
 
-            # Cleanup masks and frames for this file (best-effort)
-            # try:
-            #     # cleanup frames
-            #     for f in os.listdir(frames_dir):
-            #         if f.endswith('.jpg'):
-            #             try:
-            #                 os.remove(os.path.join(frames_dir, f))
-            #             except Exception:
-            #                 pass
-            #     try:
-            #         # os.rmdir(frames_dir)
-            #     except Exception:
-            #         pass
-            # except Exception:
-            #     pass
-
         if not per_file_outputs:
             return {"output_path": None, "labels": [], "schema_json_path": schema_json_path, "results_artifacts": results_artifacts}
 
@@ -539,4 +528,5 @@ class SamuraiULRModel:
             "schema_json_path": schema_json_path,
             "results_artifacts": results_artifacts,
             "group_parquet": group_parquet,
+            "temp_datasets": sorted(set(temp_datasets)),
         }
