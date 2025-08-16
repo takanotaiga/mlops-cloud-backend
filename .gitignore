@@ -3,6 +3,7 @@ __pycache__
 work
 work_infer
 work_thumb
+datasets
 *.pt
 *.mp4
 *.jpg
