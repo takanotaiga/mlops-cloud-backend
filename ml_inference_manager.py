@@ -10,8 +10,7 @@ from backend_module.uuid_tools import get_uuid
 from query import ml_inference_job_query
 from query.encoded_segment_query import get_segments_with_file_by_keys
 from query.utils import extract_results, rid_leaf
-from query.inference_result_query import insert_inference_result
-from backend_module.encoder import transcode_video
+ 
 import mimetypes
 from collections import defaultdict
 import re
@@ -287,11 +286,20 @@ class MLInferenceRunner:
             # NOTE: We no longer import or call ml_module directly here.
             # All model execution must happen in a separate Python process.
 
-            # Update status to running
-            # try:
-            #     ml_inference_job_query.set_inference_job_status(self.db_manager, job_id, "ProcessRunning")
-            # except Exception:
-            #     pass
+            # Update status to running (required before Completed)
+            try:
+                ml_inference_job_query.set_inference_job_status(
+                    self.db_manager, job_id, "ProcessRunning"
+                )
+            except Exception as _e:
+                # If we cannot move to running, fail the job explicitly so the loop doesn't retry forever
+                try:
+                    ml_inference_job_query.set_inference_job_status(
+                        self.db_manager, job_id, "Faild"
+                    )
+                except Exception:
+                    pass
+                raise
 
             # Prepare a per-job working directory
             work_dir = Path("work_infer") / get_uuid(16)
@@ -305,7 +313,10 @@ class MLInferenceRunner:
                 ) = self.dataset_download(job_id=job_id, work_dir=work_dir)
                 if not grouped:
                     print("No valid groups produced for this job.")
-                    ml_inference_job_query.set_inference_job_status(self.db_manager, job_id, "Completed")
+                    # We are already in ProcessRunning, so completing is valid
+                    ml_inference_job_query.set_inference_job_status(
+                        self.db_manager, job_id, "Completed"
+                    )
                     return
                 
                 file_groups = self._build_file_groups(
@@ -316,11 +327,16 @@ class MLInferenceRunner:
                 )
                 
                 from ml_module import registry
+                from ml_module.postprocess import postprocess_video_paths
+                from ml_module.uploader import upload_group_results, GroupUploadItem
+
+                # 1) Run inference per group and collect result paths
+                result_paths: list[str] = []
+                group_contexts: list[dict] = []
                 for gi, fg in enumerate(file_groups, start=1):
                     g_work_dir = work_dir / f"g_{gi:03d}"
                     g_work_dir.mkdir(parents=True, exist_ok=True)
-                    # Delegate execution and debug logging to registry
-                    registry.run_inference_task(
+                    res = registry.run_inference_task(
                         db_manager=self.db_manager,
                         job_id=str(job_id),
                         task_type=str(task_type),
@@ -329,210 +345,69 @@ class MLInferenceRunner:
                         file_group=fg,
                         work_dir=str(g_work_dir),
                     )
+                    out_path = None
+                    schema_json_path = None
+                    results_artifacts = None
+                    group_parquet = None
+                    if isinstance(res, dict):
+                        out_path = res.get("output_path")
+                        schema_json_path = res.get("schema_json_path")
+                        results_artifacts = res.get("results_artifacts")
+                        group_parquet = res.get("group_parquet")
+                    elif isinstance(res, str):
+                        out_path = res
+                    if out_path:
+                        result_paths.append(out_path)
+                    else:
+                        result_paths.append("")  # placeholder to keep indexing stable
+                    # derive dataset and file_ids for this group from fg
+                    file_ids = [str(x.get("file_id")) for x in fg if x.get("file_id")]
+                    dataset = str(fg[0].get("dataset")) if fg and fg[0].get("dataset") else None
+                    group_contexts.append({
+                        "index": gi,
+                        "dataset": dataset,
+                        "file_ids": file_ids,
+                        "schema_json_path": schema_json_path,
+                        "results_artifacts": results_artifacts,
+                        "group_parquet": group_parquet,
+                    })
 
+                # 2) Postprocess all result videos (e.g., transcode)
+                processed_paths = postprocess_video_paths([p for p in result_paths if p], str(work_dir / "post"))
+
+                # 3) Upload to S3 and register DB records via module
+                items: list[GroupUploadItem] = []
+                pi = 0
+                for ctx, orig in zip(group_contexts, result_paths):
+                    vp: Optional[str] = None
+                    if orig:
+                        if pi < len(processed_paths):
+                            vp = processed_paths[pi]
+                            pi += 1
+                    items.append(
+                        GroupUploadItem(
+                            index=ctx["index"],
+                            dataset=ctx["dataset"],
+                            file_ids=ctx["file_ids"],
+                            video_path=vp,
+                            schema_json_path=ctx.get("schema_json_path"),
+                            group_parquet=ctx.get("group_parquet"),
+                            results_artifacts=ctx.get("results_artifacts") or [],
+                        )
+                    )
+
+                upload_group_results(
+                    db_manager=self.db_manager,
+                    uploader=self.uploader,
+                    job_id=str(job_id),
+                    items=items,
+                )
+
+                # 4) Mark job completed
+                ml_inference_job_query.set_inference_job_status(self.db_manager, job_id, "Completed")
                 return
 
 
-                # Process each group via the selected model adapter
-                for gi, group in enumerate(grouped, start=1):
-                    # Determine member file ids in order of appearance
-                    file_ids_in_group: List[str] = []
-                    for p, _seq in group:
-                        # find file id owning this segment
-                        for fid, segs in file_segments.items():
-                            if any(s.get("local_path") == p for s in segs):
-                                if fid not in file_ids_in_group:
-                                    file_ids_in_group.append(fid)
-                                break
-                    
-                    work_gdir = work_dir / f"g_{gi:03d}"
-                    work_gdir.mkdir(parents=True, exist_ok=True)
-                    # Build model input group
-                    model_group = []
-                    for fid in file_ids_in_group:
-                        seg_paths = [s["local_path"] for s in file_segments.get(fid, [])]
-                        if not seg_paths:
-                            continue
-                        model_group.append({
-                            "file_id": fid,
-                            "dataset": file_dataset_by_id.get(fid),
-                            "name": file_name_by_id.get(fid),
-                            "segments": seg_paths,
-                        })
-                    if not model_group:
-                        continue
-
-                    # Prepare input spec for external CLI and run it
-                    cli_in = {
-                        "jobId": str(job_id),
-                        "taskType": task_type,
-                        "model": model,
-                        "modelSource": model_source,
-                        "group": model_group,
-                        # Optional: include DB connection info if the script needs it in the future
-                        # Currently not used by the CLI runner.
-                    }
-                    in_path = work_gdir / "input.json"
-                    out_path_json = work_gdir / "result.json"
-                    with open(in_path, "w", encoding="utf-8") as f:
-                        json.dump(cli_in, f, ensure_ascii=False)
-
-                    cmd = [
-                        "python3",
-                        "-m",
-                        "ml_module.cli_run_group",
-                        "--input",
-                        str(in_path),
-                        "--work-dir",
-                        str(work_gdir),
-                        "--result",
-                        str(out_path_json),
-                    ]
-                    try:
-                        completed = subprocess.run(cmd, check=True, capture_output=True, text=True)
-                    except subprocess.CalledProcessError as cpe:
-                        print("External ML process failed:")
-                        print(cpe.stdout)
-                        print(cpe.stderr)
-                        raise
-
-                    try:
-                        with open(out_path_json, "r", encoding="utf-8") as f:
-                            model_res = json.load(f)
-                    except Exception as e:
-                        raise RuntimeError(f"Failed to read model result JSON: {e}")
-
-                    final_path = model_res.get("output_path")
-                    labels = model_res.get("labels", []) or []
-                    schema_json_path = model_res.get("schema_json_path")
-                    results_artifacts = model_res.get("results_artifacts", []) or []
-                    # Optional overall Parquet path for the whole group
-                    group_parquet = model_res.get("group_parquet")
-                    if not final_path:
-                        continue
-
-                    # Optionally compress/transcode the final result to reduce size
-                    enc_final_path = str(work_gdir / "group_tracked_enc.mp4")
-                    try:
-                        enc_final_path = transcode_video(final_path, output_path=enc_final_path)
-                    except Exception as _e:
-                        # If transcode fails, fall back to the original
-                        enc_final_path = final_path
-
-                    # Upload result video
-                    dataset = None
-                    if file_ids_in_group:
-                        dataset = file_dataset_by_id.get(file_ids_in_group[0])
-                    result_key = f"inference/{rid_leaf(job_id)}/group_{gi:03d}.mp4"
-                    up = self.uploader.upload_file_as(enc_final_path, result_key)
-                    if up.status != S3Info.SUCCESS:
-                        raise RuntimeError(f"Upload inference result failed: {up.error}")
-
-                    # Register inference_result row
-                    size = Path(enc_final_path).stat().st_size
-                    insert_inference_result(
-                        self.db_manager,
-                        job_id=job_id,
-                        dataset=dataset,
-                        files=file_ids_in_group,
-                        key=result_key,
-                        bucket=self.uploader.bucket,
-                        size=size,
-                        labels=sorted(set(labels)),
-                        meta={
-                            "groupIndex": gi,
-                            "sourceFiles": file_ids_in_group,
-                            "artifact": "plot_video",
-                        },
-                    )
-
-                    # Upload schema JSON alongside the plot video and register to DB
-                    try:
-                        if schema_json_path and os.path.exists(schema_json_path):
-                            schema_key = f"inference/{rid_leaf(job_id)}/group_{gi:03d}_schema.json"
-                            up_js = self.uploader.upload_file_as(schema_json_path, schema_key)
-                            if up_js.status != S3Info.SUCCESS:
-                                raise RuntimeError(f"Upload schema JSON failed: {up_js.error}")
-                            size_js = Path(schema_json_path).stat().st_size
-                            insert_inference_result(
-                                self.db_manager,
-                                job_id=job_id,
-                                dataset=dataset,
-                                files=file_ids_in_group,
-                                key=schema_key,
-                                bucket=self.uploader.bucket,
-                                size=size_js,
-                                labels=[],
-                                meta={
-                                    "groupIndex": gi,
-                                    "sourceFiles": file_ids_in_group,
-                                    "artifact": "schema_json",
-                                    "contentType": "application/json",
-                                },
-                            )
-                        # Upload overall inference parquet if provided by model
-                        if group_parquet and os.path.exists(group_parquet):
-                            gp_key = f"inference/{rid_leaf(job_id)}/group_{gi:03d}/overall_results.parquet"
-                            up_gp = self.uploader.upload_file_as(group_parquet, gp_key)
-                            if up_gp.status == S3Info.SUCCESS:
-                                size_gp = Path(group_parquet).stat().st_size
-                                insert_inference_result(
-                                    self.db_manager,
-                                    job_id=job_id,
-                                    dataset=dataset,
-                                    files=file_ids_in_group,
-                                    key=gp_key,
-                                    bucket=self.uploader.bucket,
-                                    size=size_gp,
-                                    labels=[],
-                                    meta={
-                                        "groupIndex": gi,
-                                        "sourceFiles": file_ids_in_group,
-                                        "artifact": "overall_results_parquet",
-                                        "contentType": "application/x-parquet",
-                                    },
-                                )
-                            else:
-                                print(f"Overall parquet upload failed: {up_gp.error}")
-                    except Exception as _e:
-                        # Fail schema upload softly without failing the whole job
-                        print(f"Schema JSON upload/insert skipped due to error: {_e}")
-
-                    # Upload per-file results artifacts (Parquet only)
-                    for art in results_artifacts:
-                        try:
-                            fid = str(art.get("file_id"))
-                            file_leaf = rid_leaf(fid)
-                            # Parquet
-                            pq_path = art.get("parquet")
-                            if pq_path and os.path.exists(pq_path):
-                                pq_key = f"inference/{rid_leaf(job_id)}/group_{gi:03d}/{file_leaf}_results.parquet"
-                                up_pq = self.uploader.upload_file_as(pq_path, pq_key)
-                                if up_pq.status == S3Info.SUCCESS:
-                                    size_pq = Path(pq_path).stat().st_size
-                                    insert_inference_result(
-                                        self.db_manager,
-                                        job_id=job_id,
-                                        dataset=dataset,
-                                        files=[fid],
-                                        key=pq_key,
-                                        bucket=self.uploader.bucket,
-                                        size=size_pq,
-                                        labels=[],
-                                        meta={
-                                            "groupIndex": gi,
-                                            "sourceFiles": [fid],
-                                            "artifact": "results_parquet",
-                                            "contentType": "application/x-parquet",
-                                        },
-                                    )
-                                else:
-                                    print(f"Parquet upload failed for {pq_path}: {up_pq.error}")
-                        except Exception as _e:
-                            print(f"Artifact upload/insert skipped due to error: {_e}")
-
-                # All groups done -> mark job completed
-                ml_inference_job_query.set_inference_job_status(self.db_manager, job_id, "Completed")
             except Exception as e:
                 try:
                     ml_inference_job_query.set_inference_job_status(self.db_manager, job_id, "Faild")
@@ -544,7 +419,7 @@ class MLInferenceRunner:
                     if work_dir.exists() and not self.keep_work_dir:
                         # Best-effort cleanup
                         import shutil
-                        # shutil.rmtree(work_dir, ignore_errors=True)
+                        
                 except Exception:
                     pass
 
