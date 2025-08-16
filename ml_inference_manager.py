@@ -2,7 +2,7 @@ import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Optional, List, Dict
+from typing import Optional, List
 
 from backend_module.database import DataBaseManager
 from backend_module.object_storage import MinioS3Uploader, S3Info
