@@ -552,7 +552,7 @@ class SamuraiULRModel:
                 except Exception:
                     pass
                 infer_started = True
-            def _infer_one(seg_path: str, seg_index: int) -> Optional[str]:
+            def _infer_one(seg_path: str, seg_index: int) -> Optional[Tuple[int, str]]:
                 try:
                     if not model_path:
                         return None
@@ -569,31 +569,63 @@ class SamuraiULRModel:
                     ])
                     if rc != 0:
                         return None
-                    return out_parquet if os.path.exists(out_parquet) else None
+                    return (seg_index, out_parquet) if os.path.exists(out_parquet) else None
                 except Exception:
                     return None
 
             seg_paths = list(segs)
-            seg_pq_paths: List[str] = []
+            # Collect results with their original indices to preserve order
+            seg_results: Dict[int, str] = {}
             if model_path and seg_paths:
                 with ThreadPoolExecutor(max_workers=10) as ex:
                     futs = [ex.submit(_infer_one, sp, si) for si, sp in enumerate(seg_paths)]
                     for fu in as_completed(futs):
-                        p = fu.result()
-                        if p:
-                            seg_pq_paths.append(p)
+                        r = fu.result()
+                        if r and isinstance(r, tuple) and len(r) == 2:
+                            si, p = r
+                            if isinstance(si, int) and isinstance(p, str):
+                                seg_results[si] = p
 
             # Merge segment parquets into group-level parquet for this file
             aggregate_started = False
-            if seg_pq_paths:
+            if seg_paths:
                 try:
                     if not aggregate_started:
                         try:
                             tracker.start("aggregate") if tracker else None
                         except Exception:
                             pass
-                    dfs = [pd.read_parquet(p) for p in seg_pq_paths]
-                    df_all = pd.concat(dfs, ignore_index=True)
+                    # Compute cumulative frame offsets for each segment using video frame counts
+                    seg_frame_counts: List[int] = []
+                    for sp in seg_paths:
+                        try:
+                            seg_frame_counts.append(_get_total_frame_count(sp))
+                        except Exception:
+                            seg_frame_counts.append(0)
+                    offsets: List[int] = []
+                    total = 0
+                    for cnt in seg_frame_counts:
+                        offsets.append(total)
+                        total += int(cnt or 0)
+
+                    # Read each available parquet and offset its frame_index by cumulative frames
+                    dfs: List[pd.DataFrame] = []
+                    for si in range(len(seg_paths)):
+                        p = seg_results.get(si)
+                        if not p:
+                            continue
+                        try:
+                            df = pd.read_parquet(p)
+                        except Exception:
+                            continue
+                        if "frame_index" in df.columns:
+                            try:
+                                df["frame_index"] = df["frame_index"].astype(int) + int(offsets[si])
+                            except Exception:
+                                pass
+                        dfs.append(df)
+
+                    df_all = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
                     group_pq = str(work / f"{Path(str(fid)).name}_infer_merged.parquet")
                     df_all.to_parquet(group_pq, index=False)
                     group_parquet_paths.append(group_pq)
