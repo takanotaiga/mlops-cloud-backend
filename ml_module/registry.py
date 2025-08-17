@@ -5,7 +5,7 @@ from backend_module.database import DataBaseManager
 
 
 class MLModel(Protocol):
-    def process_group(self, db_manager: DataBaseManager, file_group: List[Dict[str, Any]], work_dir: str) -> Dict[str, Any]:
+    def process_group(self, db_manager: DataBaseManager, job_id: str, file_group: List[Dict[str, Any]], work_dir: str) -> Dict[str, Any]:
         ...
 
 
@@ -55,4 +55,4 @@ def run_inference_task(
         return None
 
     # Execute model-specific processing
-    return adapter.process_group(db_manager, file_group, work_dir)
+    return adapter.process_group(db_manager, job_id, file_group, work_dir)
