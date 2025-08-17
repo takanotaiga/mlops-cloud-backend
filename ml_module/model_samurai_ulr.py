@@ -329,7 +329,7 @@ class SamuraiULRModel:
                 "name": str(item.get("name") or ""),
                 "parquet": parquet_path,
                 # Description to be propagated to DB metadata
-                "description": "各ファイルのSAM2推論結果 (Parquet)",
+                "description": "タイムラプス動画のSAM2推論結果",
             })
 
             # Plotting: read saved results and overlay per-frame bboxes
@@ -649,7 +649,7 @@ class SamuraiULRModel:
             "group_parquet": group_parquet,
             "temp_datasets": sorted(set(temp_datasets)),
             # Human-readable descriptions propagated to uploader
-            "video_description": "タイムラプス動画にSAM2の推論結果をプロットした動画です。",
-            "schema_description": "SAM2推論結果のスキーマ定義 (JSON)。",
-            "group_parquet_description": "グループ全体のSAM2推論結果 (Parquet)。",
+            "video_description": "タイムラプス動画にSAM2の推論結果をプロットした動画",
+            "schema_description": "SAM2推論結果のスキーマ定義",
+            "group_parquet_description": "全ての動画に対する最終推論結果",
         }
