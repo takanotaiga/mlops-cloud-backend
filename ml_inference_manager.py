@@ -6,6 +6,7 @@ from typing import Optional, List
 
 from backend_module.database import DataBaseManager
 from backend_module.object_storage import MinioS3Uploader, S3Info
+from backend_module.config import load_surreal_config, load_s3_config
 from backend_module.uuid_tools import get_uuid
 from query import ml_inference_job_query
 from query.encoded_segment_query import get_segments_with_file_by_keys
@@ -36,37 +37,28 @@ class MLInferenceRunner:
         # Polling interval seconds
         self.interval = float(_get_env("POLL_INTERVAL", str(interval if interval is not None else 5)))
 
-        # SurrealDB configuration (env-driven with local-dev defaults)
-        surreal_endpoint = _get_env("SURREAL_ENDPOINT", "ws://192.168.1.25:65303/rpc")
-        surreal_username = _get_env("SURREAL_USERNAME", "root")
-        surreal_password = _get_env("SURREAL_PASSWORD", "root")
-        surreal_namespace = _get_env("SURREAL_NAMESPACE", "mlops")
-        surreal_database = _get_env("SURREAL_DATABASE", "cloud_ui")
-
-        # S3/MinIO configuration (env-driven with local-dev defaults)
-        s3_endpoint = _get_env("S3_ENDPOINT", "http://192.168.1.25:65300")
-        s3_access_key = _get_env("S3_ACCESS_KEY", "minioadmin")
-        s3_secret_key = _get_env("S3_SECRET_KEY", "minioadmin")
-        s3_bucket = _get_env("S3_BUCKET", "mlops-datasets")
-
-        # Initialize database manager (thread-safe query)
+        # SurrealDB configuration (compose-friendly)
+        sconf = load_surreal_config()
         self.db_manager = DataBaseManager(
-            endpoint_url=surreal_endpoint,
-            username=surreal_username,
-            password=surreal_password,
-            namespace=surreal_namespace,
-            database=surreal_database,
+            endpoint_url=sconf["endpoint_url"],
+            username=sconf["username"],
+            password=sconf["password"],
+            namespace=sconf["namespace"],
+            database=sconf["database"],
         )
 
-        # Initialize object storage client with multipart settings similar to video_manager
+        # S3/MinIO configuration (compose-friendly)
+        mconf = load_s3_config()
         self.uploader = MinioS3Uploader(
-            endpoint_url=s3_endpoint,
-            access_key=s3_access_key,
-            secret_key=s3_secret_key,
-            bucket=s3_bucket,
-            multipart_threshold_bytes=300 * 1024 * 1024,  # 300MB
-            multipart_chunksize_bytes=64 * 1024 * 1024,   # 64MB
-            part_concurrency=4,
+            endpoint_url=mconf["endpoint_url"],
+            access_key=mconf["access_key"],
+            secret_key=mconf["secret_key"],
+            bucket=mconf["bucket"],
+            region_name=mconf["region_name"],
+            multipart_threshold_bytes=mconf["multipart_threshold_bytes"],
+            multipart_chunksize_bytes=mconf["multipart_chunksize_bytes"],
+            part_concurrency=mconf["part_concurrency"],
+            addressing_style=mconf["addressing_style"],
         )
 
         self.next_time = time.time()

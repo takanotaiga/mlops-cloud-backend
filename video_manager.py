@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from backend_module.database import DataBaseManager
 from backend_module.object_storage import MinioS3Uploader, S3Info
+from backend_module.config import load_surreal_config, load_s3_config
 from backend_module.encoder import encode_to_segments, probe_video, create_thumbnail
 from query import encode_job_query, file_query
 from query.encoded_segment_query import insert_encoded_segment
@@ -15,21 +16,28 @@ from query.utils import rid_leaf
 class TaskRunner:
     def __init__(self, interval=5):
         self.interval = interval
+        # SurrealDB from environment (compose-friendly)
+        sconf = load_surreal_config()
         self.db_manager = DataBaseManager(
-            endpoint_url="ws://192.168.1.25:65303/rpc",
-            username="root",
-            password="root",
-            namespace="mlops",
-            database="cloud_ui"
+            endpoint_url=sconf["endpoint_url"],
+            username=sconf["username"],
+            password=sconf["password"],
+            namespace=sconf["namespace"],
+            database=sconf["database"],
         )
+
+        # MinIO/S3 from environment (compose-friendly)
+        mconf = load_s3_config()
         self.uploader = MinioS3Uploader(
-            endpoint_url="http://192.168.1.25:65300",
-            access_key="minioadmin",
-            secret_key="minioadmin",
-            bucket="mlops-datasets",
-            multipart_threshold_bytes=300 * 1024 * 1024,  # 300MB
-            multipart_chunksize_bytes=64 * 1024 * 1024,   # 128MB
-            part_concurrency=4,
+            endpoint_url=mconf["endpoint_url"],
+            access_key=mconf["access_key"],
+            secret_key=mconf["secret_key"],
+            bucket=mconf["bucket"],
+            region_name=mconf["region_name"],
+            multipart_threshold_bytes=mconf["multipart_threshold_bytes"],
+            multipart_chunksize_bytes=mconf["multipart_chunksize_bytes"],
+            part_concurrency=mconf["part_concurrency"],
+            addressing_style=mconf["addressing_style"],
         )
 
         self.next_time = time.time()
