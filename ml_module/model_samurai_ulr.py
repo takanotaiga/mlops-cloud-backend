@@ -167,13 +167,7 @@ class SamuraiULRModel:
         results_artifacts: List[Dict[str, str]] = []
         group_parquet_paths: List[str] = []
         temp_datasets: List[str] = []
-        schema_json_path = str(work / "samurai_ulr_schema.json")
-        # Write schema JSON once per group
-        try:
-            with open(schema_json_path, "w", encoding="utf-8") as f:
-                json.dump(_results_schema_json(), f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
+        # Schema JSON generation/upload is not required.
 
         # Progress tracker (do not re-initialize steps here; manager already did)
         tracker = None
@@ -614,7 +608,7 @@ class SamuraiULRModel:
                         aggregate_started = True
 
         if not per_file_outputs:
-            return {"output_path": None, "labels": [], "schema_json_path": schema_json_path, "results_artifacts": results_artifacts}
+            return {"output_path": None, "labels": [], "results_artifacts": results_artifacts}
 
         # concat per-file outputs if more than one
         if len(per_file_outputs) > 1:
@@ -644,12 +638,10 @@ class SamuraiULRModel:
         return {
             "output_path": final_path,
             "labels": sorted(set(per_file_labels)),
-            "schema_json_path": schema_json_path,
             "results_artifacts": results_artifacts,
             "group_parquet": group_parquet,
             "temp_datasets": sorted(set(temp_datasets)),
             # Human-readable descriptions propagated to uploader
             "video_description": "タイムラプス動画にSAM2の推論結果をプロットした動画",
-            "schema_description": "SAM2推論結果のスキーマ定義",
             "group_parquet_description": "全ての動画に対する最終推論結果",
         }
