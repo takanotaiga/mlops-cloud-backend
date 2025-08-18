@@ -16,7 +16,8 @@ WORKDIR /app
 RUN pip install --no-cache-dir \
     psutil \
     nvidia-ml-py3 \
-    surrealdb
+    surrealdb \
+    pynvml
 
 # Copy only what we need
 COPY backend_module ./backend_module
