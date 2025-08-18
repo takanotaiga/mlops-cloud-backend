@@ -1,0 +1,33 @@
+# Simple container for hardware_metrics_manager.py
+# - Collects system + NVIDIA GPU metrics and writes to SurrealDB
+# - Requires NVIDIA Container Toolkit on host if using GPU metrics
+
+FROM python:3.10-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+WORKDIR /app
+
+# Install runtime dependencies
+# - psutil: system metrics
+# - nvidia-ml-py3: NVML Python bindings (GPU metrics)
+# - surrealdb: SurrealDB Python client
+RUN pip install --no-cache-dir \
+    psutil \
+    nvidia-ml-py3 \
+    surrealdb
+
+# Copy only what we need
+COPY backend_module ./backend_module
+COPY hardware_metrics_manager.py ./
+
+# Default environment (override at run time as needed)
+# ENV SURREAL_URL=ws://host.docker.internal:8000/rpc \
+#     SURREAL_NS=mlops \
+#     SURREAL_DB=cloud_ui \
+#     SURREAL_USER=root \
+#     SURREAL_PASS=root
+
+CMD ["python", "hardware_metrics_manager.py"]
+

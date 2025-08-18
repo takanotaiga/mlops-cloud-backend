@@ -11,6 +11,7 @@ from backend_module.uuid_tools import get_uuid
 from query import ml_inference_job_query
 from query.encoded_segment_query import get_segments_with_file_by_keys
 from query.utils import extract_results
+from backend_module.progress_tracker import InferenceJobProgressTracker
  
 import mimetypes
 from collections import defaultdict
@@ -296,13 +297,19 @@ class MLInferenceRunner:
             # Prepare a per-job working directory
             work_dir = Path("work_infer") / get_uuid(16)
             try:
+                # Initialize progress tracker and default steps
+                tracker = InferenceJobProgressTracker(self.db_manager, str(job_id))
+                tracker.init_default_steps()
+
                 # Download dataset and build groups
+                tracker.start("download")
                 (
                     file_segments,
                     file_name_by_id,
                     file_dataset_by_id,
                     grouped,
                 ) = self.dataset_download(job_id=job_id, work_dir=work_dir)
+                tracker.complete("download")
                 if not grouped:
                     print("No valid groups produced for this job.")
                     # We are already in ProcessRunning, so completing is valid
@@ -381,7 +388,15 @@ class MLInferenceRunner:
                     })
 
                 # 2) Postprocess all result videos (e.g., transcode)
+                try:
+                    tracker.start("postprocess")
+                except Exception:
+                    pass
                 processed_paths = postprocess_video_paths([p for p in result_paths if p], str(work_dir / "post"))
+                try:
+                    tracker.complete("postprocess")
+                except Exception:
+                    pass
 
                 # 3) Upload to S3 and register DB records via module
                 items: list[GroupUploadItem] = []
@@ -413,6 +428,15 @@ class MLInferenceRunner:
                     job_id=str(job_id),
                     items=items,
                 )
+                # Upload step
+                try:
+                    tracker.start("upload")
+                except Exception:
+                    pass
+                try:
+                    tracker.complete("upload")
+                except Exception:
+                    pass
 
                 # 4) Mark job completed
                 ml_inference_job_query.set_inference_job_status(self.db_manager, job_id, "Completed")
@@ -422,6 +446,11 @@ class MLInferenceRunner:
             except Exception as e:
                 try:
                     ml_inference_job_query.set_inference_job_status(self.db_manager, job_id, "Faild")
+                except Exception:
+                    pass
+                try:
+                    # Best effort to mark the last started step as failed
+                    tracker.fail("upload") if 'tracker' in locals() else None
                 except Exception:
                     pass
                 print(f"Inference job {job_id} failed: {e}")

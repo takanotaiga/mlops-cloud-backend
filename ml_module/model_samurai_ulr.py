@@ -144,6 +144,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import shutil
 
 
+from backend_module.progress_tracker import InferenceJobProgressTracker, StepState
+
+
 class SamuraiULRModel:
     """Adapter that prepares inputs and runs SAM2 tracking per group of files.
 
@@ -155,7 +158,7 @@ class SamuraiULRModel:
     }
     """
 
-    def process_group(self, db_manager, file_group: List[Dict[str, Any]], work_dir: str) -> Dict[str, Any]:
+    def process_group(self, db_manager, job_id: str, file_group: List[Dict[str, Any]], work_dir: str) -> Dict[str, Any]:
         work = Path(work_dir)
         work.mkdir(parents=True, exist_ok=True)
 
@@ -164,13 +167,21 @@ class SamuraiULRModel:
         results_artifacts: List[Dict[str, str]] = []
         group_parquet_paths: List[str] = []
         temp_datasets: List[str] = []
-        schema_json_path = str(work / "samurai_ulr_schema.json")
-        # Write schema JSON once per group
+        # Schema JSON generation/upload is not required.
+
+        # Progress tracker (do not re-initialize steps here; manager already did)
+        tracker = None
         try:
-            with open(schema_json_path, "w", encoding="utf-8") as f:
-                json.dump(_results_schema_json(), f, ensure_ascii=False, indent=2)
+            tracker = InferenceJobProgressTracker(db_manager, str(job_id))
         except Exception:
-            pass
+            tracker = None
+
+        # Preprocess step begins at the first file
+        preprocess_started = False
+
+        train_started = False
+        infer_started = False
+        dataset_started = False
 
         for item in file_group:
             fid = item.get("file_id")
@@ -178,6 +189,11 @@ class SamuraiULRModel:
             if not segs:
                 continue
             # 1) Timelapse each segment in parallel and merge to keep <= 16384 frames
+            if not preprocess_started:
+                try:
+                    tracker.start("preprocess") if tracker else None
+                except Exception:
+                    pass
             merged = str(work / f"{Path(str(fid)).name}_merged_timelapse.mp4")
             try:
                 _merged_path, _step = timelapse_merge(segs, merged, max_frames=16384, max_workers=4)
@@ -210,6 +226,18 @@ class SamuraiULRModel:
             if total_fc >= 16384:
                 raise ValueError(f"Video {merged} has {total_fc} frames (>=16384); rejecting before inference.")
             frame_count, width, height, fps = _extract_frames(merged, frames_dir)
+            if not preprocess_started:
+                try:
+                    tracker.complete("preprocess") if tracker else None
+                except Exception:
+                    pass
+                preprocess_started = True
+
+            # Start SAM2 immediately after preprocess for clarity in UI
+            try:
+                tracker.start("sam2") if tracker else None
+            except Exception:
+                pass
 
             # Run predict strictly one key per call using CLI and collect results
             # Then merge per-seed parquet files into a single parquet for this file
@@ -245,39 +273,37 @@ class SamuraiULRModel:
 
             # Merge per-seed parquet files and add metadata columns
             parquet_path = str(work / f"{Path(str(fid)).name}_results.parquet")
-            try:
-                dfs = []
-                for si, pqp in enumerate(per_seed_parquets):
+            dfs = []
+            for si, pqp in enumerate(per_seed_parquets):
+                try:
+                    df = pd.read_parquet(pqp)
+                except Exception:
+                    continue
+                # normalize/augment columns to match schema
+                if "frame_idx" in df.columns and "frame_index" not in df.columns:
+                    df = df.rename(columns={"frame_idx": "frame_index"})
+                if "area" not in df.columns:
                     try:
-                        df = pd.read_parquet(pqp)
-                        # normalize/augment columns to match schema
-                        if "frame_idx" in df.columns and "frame_index" not in df.columns:
-                            df = df.rename(columns={"frame_idx": "frame_index"})
-                        if "area" not in df.columns:
-                            try:
-                                df["area"] = (df["w"].astype(int) * df["h"].astype(int)).astype(int)
-                            except Exception:
-                                df["area"] = 0
-                        df["file_id"] = str(fid)
-                        df["video_name"] = str(item.get("name") or "")
-                        df["seed_index"] = int(si)
-                        df["label"] = str(seeds[si].label if si < len(seeds) else "")
-                        dfs.append(df)
+                        df["area"] = (df["w"].astype(int) * df["h"].astype(int)).astype(int)
                     except Exception:
-                        continue
+                        df["area"] = 0
+                df["file_id"] = str(fid)
+                df["video_name"] = str(item.get("name") or "")
+                df["seed_index"] = int(si)
+                df["label"] = str(seeds[si].label if si < len(seeds) else "")
+                dfs.append(df)
+
+            try:
                 if dfs:
                     df_all = pd.concat(dfs, ignore_index=True)
-                    df_all.to_parquet(parquet_path, index=False)
                 else:
-                    # write empty parquet with expected columns
-                    df_empty = pd.DataFrame([], columns=[
+                    df_all = pd.DataFrame([], columns=[
                         "file_id", "video_name", "seed_index", "label", "frame_index", "x", "y", "w", "h", "area"
                     ])
-                    df_empty.to_parquet(parquet_path, index=False)
+                df_all.to_parquet(parquet_path, index=False)
             except Exception:
                 # If merge fails, fallback to empty
                 try:
-                    import pandas as pd
                     df_empty = pd.DataFrame([], columns=[
                         "file_id", "video_name", "seed_index", "label", "frame_index", "x", "y", "w", "h", "area"
                     ])
@@ -285,13 +311,19 @@ class SamuraiULRModel:
                 except Exception:
                     pass
 
-        # Record artifact paths for upload by the caller
+            # Complete SAM2 right after result parquet is ready
+            try:
+                tracker.complete("sam2") if tracker else None
+            except Exception:
+                pass
+
+            # Record artifact paths for upload by the caller
             results_artifacts.append({
                 "file_id": str(fid),
                 "name": str(item.get("name") or ""),
                 "parquet": parquet_path,
                 # Description to be propagated to DB metadata
-                "description": "各ファイルのSAM2推論結果 (Parquet)",
+                "description": "タイムラプス動画のSAM2推論結果",
             })
 
             # Plotting: read saved results and overlay per-frame bboxes
@@ -305,6 +337,11 @@ class SamuraiULRModel:
 
             # 2) YOLO dataset export from SAM2 results (timelapse frames + parquet)
             try:
+                if not dataset_started:
+                    try:
+                        tracker.start("dataset_export") if tracker else None
+                    except Exception:
+                        pass
                 # Place dataset under /workspace/src/datasets per RT-DETR spec
                 datasets_base = Path("/workspace/src/datasets")
                 dataset_name = f"yolo_dataset_{Path(str(fid)).name}"
@@ -403,8 +440,22 @@ class SamuraiULRModel:
                             f"names: {label_names}",
                         ])
                     )
+                if not dataset_started:
+                    try:
+                        tracker.complete("dataset_export") if tracker else None
+                    except Exception:
+                        pass
+                    dataset_started = True
 
                 # 3) Train RT-DETR via CLI and optionally export TensorRT
+                if not train_started:
+                    try:
+                        # Transition SAM2 -> RT-DETR train on first encounter
+                        tracker.complete("sam2") if tracker else None
+                        tracker.start("rtdetr_train") if tracker else None
+                    except Exception:
+                        pass
+                    train_started = True
                 train_out = Path(work) / f"train_result_{Path(str(fid)).name}"
                 train_json = Path(work) / f"train_result_{Path(str(fid)).name}.json"
                 rc = cmd_exec([
@@ -432,6 +483,12 @@ class SamuraiULRModel:
                         cached = _TRT_EXPORT_CACHE.get(str(model_pt))
                     if cached is not None:
                         model_engine = cached
+                        try:
+                            # Even if cached, reflect that export is effectively complete
+                            tracker.start("trt_export") if tracker else None
+                            tracker.complete("trt_export") if tracker else None
+                        except Exception:
+                            pass
                     else:
                         export_json = Path(work) / f"export_engine_{Path(str(fid)).name}.json"
                         # If an export JSON already exists (e.g., rerun), try to reuse it
@@ -442,10 +499,19 @@ class SamuraiULRModel:
                                 maybe_engine = exp_res.get("engine")
                                 if maybe_engine and os.path.exists(maybe_engine):
                                     model_engine = maybe_engine
+                                    try:
+                                        tracker.start("trt_export") if tracker else None
+                                        tracker.complete("trt_export") if tracker else None
+                                    except Exception:
+                                        pass
                             except Exception:
                                 pass
                         # Perform export only if not already resolved
                         if not model_engine:
+                            try:
+                                tracker.start("trt_export") if tracker else None
+                            except Exception:
+                                pass
                             rc2 = cmd_exec([
                                 "python3", "-m", "ml_module.cli_export_trt",
                                 "--weights", str(model_pt),
@@ -458,6 +524,15 @@ class SamuraiULRModel:
                                     model_engine = exp_res.get("engine")
                                 except Exception:
                                     model_engine = None
+                                try:
+                                    tracker.complete("trt_export") if tracker else None
+                                except Exception:
+                                    pass
+                            else:
+                                try:
+                                    tracker.fail("trt_export") if tracker else None
+                                except Exception:
+                                    pass
                         # Update cache with result (including None to avoid repeated attempts)
                         with _TRT_EXPORT_LOCK:
                             _TRT_EXPORT_CACHE[str(model_pt)] = model_engine
@@ -469,7 +544,15 @@ class SamuraiULRModel:
                 model_path = None
 
             # 4) Inference on original segments in parallel -> per-segment parquet, then merge
-            def _infer_one(seg_path: str, seg_index: int) -> Optional[str]:
+            if not infer_started:
+                try:
+                    # Transition RT-DETR train -> RT-DETR inference
+                    tracker.complete("rtdetr_train") if (tracker and train_started) else None
+                    tracker.start("rtdetr_infer") if tracker else None
+                except Exception:
+                    pass
+                infer_started = True
+            def _infer_one(seg_path: str, seg_index: int) -> Optional[Tuple[int, str]]:
                 try:
                     if not model_path:
                         return None
@@ -486,33 +569,78 @@ class SamuraiULRModel:
                     ])
                     if rc != 0:
                         return None
-                    return out_parquet if os.path.exists(out_parquet) else None
+                    return (seg_index, out_parquet) if os.path.exists(out_parquet) else None
                 except Exception:
                     return None
 
             seg_paths = list(segs)
-            seg_pq_paths: List[str] = []
+            # Collect results with their original indices to preserve order
+            seg_results: Dict[int, str] = {}
             if model_path and seg_paths:
                 with ThreadPoolExecutor(max_workers=10) as ex:
                     futs = [ex.submit(_infer_one, sp, si) for si, sp in enumerate(seg_paths)]
                     for fu in as_completed(futs):
-                        p = fu.result()
-                        if p:
-                            seg_pq_paths.append(p)
+                        r = fu.result()
+                        if r and isinstance(r, tuple) and len(r) == 2:
+                            si, p = r
+                            if isinstance(si, int) and isinstance(p, str):
+                                seg_results[si] = p
 
             # Merge segment parquets into group-level parquet for this file
-            if seg_pq_paths:
+            aggregate_started = False
+            if seg_paths:
                 try:
-                    dfs = [pd.read_parquet(p) for p in seg_pq_paths]
-                    df_all = pd.concat(dfs, ignore_index=True)
+                    if not aggregate_started:
+                        try:
+                            tracker.start("aggregate") if tracker else None
+                        except Exception:
+                            pass
+                    # Compute cumulative frame offsets for each segment using video frame counts
+                    seg_frame_counts: List[int] = []
+                    for sp in seg_paths:
+                        try:
+                            seg_frame_counts.append(_get_total_frame_count(sp))
+                        except Exception:
+                            seg_frame_counts.append(0)
+                    offsets: List[int] = []
+                    total = 0
+                    for cnt in seg_frame_counts:
+                        offsets.append(total)
+                        total += int(cnt or 0)
+
+                    # Read each available parquet and offset its frame_index by cumulative frames
+                    dfs: List[pd.DataFrame] = []
+                    for si in range(len(seg_paths)):
+                        p = seg_results.get(si)
+                        if not p:
+                            continue
+                        try:
+                            df = pd.read_parquet(p)
+                        except Exception:
+                            continue
+                        if "frame_index" in df.columns:
+                            try:
+                                df["frame_index"] = df["frame_index"].astype(int) + int(offsets[si])
+                            except Exception:
+                                pass
+                        dfs.append(df)
+
+                    df_all = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
                     group_pq = str(work / f"{Path(str(fid)).name}_infer_merged.parquet")
                     df_all.to_parquet(group_pq, index=False)
                     group_parquet_paths.append(group_pq)
                 except Exception:
                     pass
+                finally:
+                    if not aggregate_started:
+                        try:
+                            tracker.complete("aggregate") if tracker else None
+                        except Exception:
+                            pass
+                        aggregate_started = True
 
         if not per_file_outputs:
-            return {"output_path": None, "labels": [], "schema_json_path": schema_json_path, "results_artifacts": results_artifacts}
+            return {"output_path": None, "labels": [], "results_artifacts": results_artifacts}
 
         # concat per-file outputs if more than one
         if len(per_file_outputs) > 1:
@@ -524,15 +652,28 @@ class SamuraiULRModel:
         # If any group parquet exists, select the first for upload at group level
         group_parquet = group_parquet_paths[0] if group_parquet_paths else None
 
+        # Complete inference step for the group
+        try:
+            tracker.complete("rtdetr_infer") if (tracker and infer_started) else None
+        except Exception:
+            pass
+
+        # Complete inference step for the group
+        try:
+            tracker.complete("rtdetr_infer") if (tracker and infer_started) else None
+            # If training never started but SAM2 was started, close SAM2
+            if tracker and not train_started:
+                tracker.complete("sam2")
+        except Exception:
+            pass
+
         return {
             "output_path": final_path,
             "labels": sorted(set(per_file_labels)),
-            "schema_json_path": schema_json_path,
             "results_artifacts": results_artifacts,
             "group_parquet": group_parquet,
             "temp_datasets": sorted(set(temp_datasets)),
             # Human-readable descriptions propagated to uploader
-            "video_description": "タイムラプス動画にSAM2の推論結果をプロットした動画です。",
-            "schema_description": "SAM2推論結果のスキーマ定義 (JSON)。",
-            "group_parquet_description": "グループ全体のSAM2推論結果 (Parquet)。",
+            "video_description": "タイムラプス動画にSAM2の推論結果をプロットした動画",
+            "group_parquet_description": "全ての動画に対する最終推論結果",
         }
