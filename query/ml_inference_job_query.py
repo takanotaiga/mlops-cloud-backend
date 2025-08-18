@@ -70,3 +70,15 @@ def set_inference_job_status(db_manager: DataBaseManager, job_id: str, new_state
     if first_result(upd) is None:
         raise ValueError("Concurrent update detected; state changed by another process")
     return {"id": job_id, "status": new_state, "updated": True, "previous": current, "result": upd}
+
+
+def has_in_progress_job(db_manager: DataBaseManager) -> bool:
+    """進行中の推論ジョブが存在するかを返す。"""
+    payload = db_manager.query(
+        "SELECT VALUE count() FROM inference_job WHERE status = 'ProcessRunning';"
+    )
+    cnt = first_result(payload)
+    try:
+        return int(cnt or 0) > 0
+    except Exception:
+        return False

@@ -17,6 +17,18 @@ def get_queued_job(db_manager: DataBaseManager) -> List[dict]:
     return extract_results(payload)
 
 
+def has_in_progress_job(db_manager: DataBaseManager) -> bool:
+    """進行中のエンコードジョブが存在するかを返す。"""
+    payload = db_manager.query(
+        "SELECT VALUE count() FROM encode_job WHERE status = 'in_progress';"
+    )
+    cnt = first_result(payload)
+    try:
+        return int(cnt or 0) > 0
+    except Exception:
+        return False
+
+
 # ---------------- Status Update API ----------------
 
 class JobNotFound(Exception):
