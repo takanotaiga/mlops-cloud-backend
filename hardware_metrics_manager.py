@@ -2,12 +2,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 import psutil
-
-try:
-    import pynvml
-    _HAS_NVML = True
-except Exception:
-    _HAS_NVML = False
+import pynvml
 
 from backend_module.database import DataBaseManager
 from backend_module.config import load_surreal_config
@@ -48,8 +43,6 @@ def _gather_gpu_metrics() -> List[Dict[str, Any]]:
     Includes utilization, memory, power, temperature, fan, PCIe throughput, and clocks.
     Returns empty list if NVML is unavailable or no GPUs present.
     """
-    if not _HAS_NVML:
-        return []
     try:
         pynvml.nvmlInit()
     except Exception:
