@@ -136,56 +136,56 @@ def ssh_git_switch_detach(
 
 def main():
     # DB client (for job status checks)
-    sconf = load_surreal_config()
-    dbm = DataBaseManager(
-        endpoint_url=sconf["endpoint_url"],
-        username=sconf["username"],
-        password=sconf["password"],
-        namespace=sconf["namespace"],
-        database=sconf["database"],
-    )
+    # sconf = load_surreal_config()
+    # dbm = DataBaseManager(
+    #     endpoint_url=sconf["endpoint_url"],
+    #     username=sconf["username"],
+    #     password=sconf["password"],
+    #     namespace=sconf["namespace"],
+    #     database=sconf["database"],
+    # )
 
     while True:
         try:
-            enc_running = encode_job_query.has_in_progress_job(dbm)
-            inf_running = ml_inference_job_query.has_in_progress_job(dbm)
+            # enc_running = encode_job_query.has_in_progress_job(dbm)
+            # inf_running = ml_inference_job_query.has_in_progress_job(dbm)
 
             print("===== Job Progress Check =====")
-            print("Encode job in progress:", enc_running)
-            print("ML inference job in progress:", inf_running)
+            # print("Encode job in progress:", enc_running)
+            # print("ML inference job in progress:", inf_running)
 
-            if not enc_running and not inf_running:
+            # if not enc_running and not inf_running:
                 # No running jobs -> deploy latest release
-                rel = get_latest_github_release(owner="takanotaiga", repo="mlops-cloud")
-                if not rel or not rel.get("tag"):
-                    print("Skip deploy: failed to fetch latest release")
-                else:
-                    tag = rel["tag"]
-                    ssh_user = os.getenv("SSH_USERNAME")
-                    ssh_pass = os.getenv("SSH_PASSWORD")
-                    if not ssh_user or not ssh_pass:
-                        print("Skip deploy: SSH_USERNAME or SSH_PASSWORD not set")
-                        continue
-                    # Switch repo to release tag
-                    _, _, status = ssh_git_switch_detach(
+            rel = get_latest_github_release(owner="takanotaiga", repo="mlops-cloud")
+            if not rel or not rel.get("tag"):
+                print("Skip deploy: failed to fetch latest release")
+            else:
+                tag = rel["tag"]
+                ssh_user = os.getenv("SSH_USERNAME")
+                ssh_pass = os.getenv("SSH_PASSWORD")
+                if not ssh_user or not ssh_pass:
+                    print("Skip deploy: SSH_USERNAME or SSH_PASSWORD not set")
+                    continue
+                # Switch repo to release tag
+                _, _, status = ssh_git_switch_detach(
+                    hostname="172.17.0.1",
+                    username=ssh_user,
+                    password=ssh_pass,
+                    repo_dir="~/mlops-cloud",
+                    release=tag,
+                )
+                if status == 0:
+                    # Bring up services with always-pull
+                    ssh_docker_compose_up(
                         hostname="172.17.0.1",
                         username=ssh_user,
                         password=ssh_pass,
-                        repo_dir="~/mlops-cloud",
-                        release=tag,
+                        workdir="~/mlops-cloud",
                     )
-                    if status == 0:
-                        # Bring up services with always-pull
-                        ssh_docker_compose_up(
-                            hostname="172.17.0.1",
-                            username=ssh_user,
-                            password=ssh_pass,
-                            workdir="~/mlops-cloud",
-                        )
-                    else:
-                        print("Deploy skipped: git switch failed (see logs above)")
-            else:
-                print("Running jobs detected; skip deploy this cycle")
+                else:
+                    print("Deploy skipped: git switch failed (see logs above)")
+            # else:
+            #     print("Running jobs detected; skip deploy this cycle")
         except Exception as e:
             print("Cycle error:", e)
 
