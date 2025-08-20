@@ -8,6 +8,7 @@ from backend_module.database import DataBaseManager
 from backend_module.object_storage import MinioS3Uploader, S3Info
 from backend_module.config import load_surreal_config, load_s3_config
 from backend_module.uuid_tools import get_uuid
+from backend_module import gpu_check
 from query import ml_inference_job_query
 from query.encoded_segment_query import get_segments_with_file_by_keys
 from query.utils import extract_results
@@ -490,5 +491,11 @@ class MLInferenceRunner:
 
 
 if __name__ == "__main__":
+    if gpu_check.is_gpu_available():
+        print("GPU detected ✅")
+    else:
+        print("No GPU detected ❌")
+        gpu_check.exit_with_delay()
+
     runner = MLInferenceRunner()
     runner.run()
