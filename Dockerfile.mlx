@@ -135,7 +135,9 @@ RUN pip install \
     requests==2.32.3 \
     surrealdb==1.0.4 \
     boto3==1.38.44 \
-    python-multipart
+    python-multipart \
+    pynvml
+
 RUN pip install --no-deps ultralytics==8.2.63
 RUN pip install "onnx>=1.12.0"
 RUN pip install --upgrade pip setuptools wheel
