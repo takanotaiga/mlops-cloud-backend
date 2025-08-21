@@ -8,7 +8,6 @@ from backend_module.database import DataBaseManager
 from backend_module.object_storage import MinioS3Uploader, S3Info
 from backend_module.config import load_surreal_config, load_s3_config
 from backend_module.encoder import encode_to_segments, probe_video, create_thumbnail
-from backend_module import gpu_check
 from query import encode_job_query, file_query
 from query.encoded_segment_query import insert_encoded_segment
 from query.utils import rid_leaf
@@ -225,13 +224,11 @@ class TaskRunner:
             if end_time - start_time > self.next_time:
                 self.next_time = end_time + self.interval
 
+    
+
+    
+
 
 if __name__ == "__main__":
-    if gpu_check.is_gpu_available():
-        print("GPU detected ✅")
-    else:
-        print("No GPU detected ❌")
-        gpu_check.exit_with_delay()
-
     runner = TaskRunner(interval=5)
     runner.run()

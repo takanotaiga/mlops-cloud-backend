@@ -6,7 +6,7 @@ import pynvml
 
 from backend_module.database import DataBaseManager
 from backend_module.config import load_surreal_config
-from backend_module import gpu_check
+
 
 def _gather_system_metrics() -> Dict[str, Any]:
     """Collect system-level CPU and memory metrics.
@@ -157,12 +157,6 @@ class HardwareMetricsManager:
 
 
 def main():
-    if gpu_check.is_gpu_available():
-        print("GPU detected ✅")
-    else:
-        print("No GPU detected ❌")
-        gpu_check.exit_with_delay()
-
     cfg = load_surreal_config()
     db = DataBaseManager(
         endpoint_url=cfg["endpoint_url"],

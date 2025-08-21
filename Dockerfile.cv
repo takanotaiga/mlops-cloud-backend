@@ -118,8 +118,7 @@ RUN python3 -m pip install -U pip && \
     requests==2.32.3 \
     surrealdb==1.0.4 \
     boto3==1.38.44 \
-    python-multipart \
-    pynvml
+    python-multipart
 
 # Copy application sources from build context
 WORKDIR /workspace/src
