@@ -4,8 +4,13 @@ from query.utils import first_result, extract_results
 
 
 def queue_unencoded_video_jobs(db_manager: DataBaseManager):
+    # From file table (existing behavior)
     db_manager.query(
         "INSERT INTO encode_job (SELECT time::now() AS created_at, id AS file, 'queued' AS status FROM file WHERE encode INSIDE ['video-none','video-merge'] AND mime ~ 'video/' AND id NOTINSIDE (SELECT VALUE file FROM encode_job));"
+    )
+    # From inference_result table: only plot_video artifacts
+    db_manager.query(
+        "INSERT INTO encode_job (SELECT time::now() AS created_at, id AS file, 'queued' AS status FROM inference_result WHERE meta.artifact = 'plot_video' AND id NOTINSIDE (SELECT VALUE file FROM encode_job));"
     )
 
 

@@ -41,3 +41,20 @@ def insert_inference_result(
         },
     )
 
+
+def get_s3key(db_manager: DataBaseManager, inference_result_id: str) -> str:
+    """Return the `key` for a given inference_result record id.
+
+    Raises KeyError if not found.
+    """
+    res = db_manager.query(
+        "SELECT VALUE key FROM inference_result WHERE id = <record> $ID LIMIT 1",
+        {"ID": inference_result_id},
+    )
+    # Lazy import to avoid circulars
+    from query.utils import first_result
+
+    key = first_result(res)
+    if key is None:
+        raise KeyError(f"Inference result not found: {inference_result_id}")
+    return key

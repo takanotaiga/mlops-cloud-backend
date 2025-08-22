@@ -5,8 +5,13 @@ from query.utils import first_result, extract_results
 
 def queue_unhls_video_jobs(db_manager: DataBaseManager):
     """Enqueue HLS jobs for videos that don't have a corresponding hls_job yet."""
+    # From file table (existing behavior)
     db_manager.query(
         "INSERT INTO hls_job (SELECT time::now() AS created_at, id AS file, 'queued' AS status FROM file WHERE encode INSIDE ['video-none','video-merge'] AND mime ~ 'video/' AND id NOTINSIDE (SELECT VALUE file FROM hls_job));"
+    )
+    # From inference_result table: only plot_video artifacts
+    db_manager.query(
+        "INSERT INTO hls_job (SELECT time::now() AS created_at, id AS file, 'queued' AS status FROM inference_result WHERE meta.artifact = 'plot_video' AND id NOTINSIDE (SELECT VALUE file FROM hls_job));"
     )
 
 
@@ -85,4 +90,3 @@ def set_hls_job_status(db_manager: DataBaseManager, job_id: str, new_state: str)
         raise InvalidJobTransition("Concurrent update detected; state changed by another process")
 
     return {"id": job_id, "status": new_state, "updated": True, "previous": current, "result": upd}
-

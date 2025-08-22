@@ -9,6 +9,7 @@ from backend_module.object_storage import MinioS3Uploader, S3Info
 from backend_module.config import load_surreal_config, load_s3_config
 from backend_module.encoder import encode_to_segments, probe_video, create_thumbnail, encode_to_hls
 from query import encode_job_query, file_query
+from query import inference_result_query
 from query.encoded_segment_query import insert_encoded_segment
 from query import hls_job_query
 from query.hls_playlist_query import insert_hls_playlist
@@ -70,8 +71,12 @@ class TaskRunner:
                 # ステータスを in_progress へ
                 encode_job_query.set_encode_job_status(self.db_manager, job_id, "in_progress")
 
-                # S3キー取得
-                s3_key = file_query.get_s3key(self.db_manager, file_id)
+                # S3キー取得（file または inference_result に対応）
+                sfile = str(file_id)
+                if sfile.startswith("inference_result:"):
+                    s3_key = inference_result_query.get_s3key(self.db_manager, file_id)
+                else:
+                    s3_key = file_query.get_s3key(self.db_manager, file_id)
 
                 # 作業ディレクトリ準備
                 work_dir.mkdir(parents=True, exist_ok=True)
@@ -160,8 +165,12 @@ class TaskRunner:
                 # ステータスを in_progress へ
                 hls_job_query.set_hls_job_status(self.db_manager, job_id, "in_progress")
 
-                # S3キー取得
-                s3_key = file_query.get_s3key(self.db_manager, file_id)
+                # S3キー取得（file または inference_result に対応）
+                sfile = str(file_id)
+                if sfile.startswith("inference_result:"):
+                    s3_key = inference_result_query.get_s3key(self.db_manager, file_id)
+                else:
+                    s3_key = file_query.get_s3key(self.db_manager, file_id)
 
                 # 作業ディレクトリ準備
                 work_dir.mkdir(parents=True, exist_ok=True)
