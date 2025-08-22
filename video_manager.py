@@ -7,9 +7,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from backend_module.database import DataBaseManager
 from backend_module.object_storage import MinioS3Uploader, S3Info
 from backend_module.config import load_surreal_config, load_s3_config
-from backend_module.encoder import encode_to_segments, probe_video, create_thumbnail
+from backend_module.encoder import encode_to_segments, probe_video, create_thumbnail, encode_to_hls
 from query import encode_job_query, file_query
 from query.encoded_segment_query import insert_encoded_segment
+from query import hls_job_query
+from query.hls_playlist_query import insert_hls_playlist
+from query.hls_segment_query import insert_hls_segment
 from query.utils import rid_leaf
  
 
@@ -48,11 +51,13 @@ class TaskRunner:
             # サムネイルを処理した場合は、このサイクルではここで終了（優先度を担保）
             return
 
-        # 新規ジョブをエンキュー
+        # 新規ジョブをエンキュー（H264 MP4 / HLS）
         encode_job_query.queue_unencoded_video_jobs(self.db_manager)
+        hls_job_query.queue_unhls_video_jobs(self.db_manager)
 
         # キュー取得（SurrealDBの応答形式を吸収）
         jobs = encode_job_query.get_queued_job(self.db_manager)
+        hls_jobs = hls_job_query.get_queued_job(self.db_manager)
 
         def _process_job(job: dict):
             job_id = job.get("id")
@@ -143,7 +148,143 @@ class TaskRunner:
                 except Exception:
                     pass
 
-        # 並列実行（最大2）
+        # HLS ジョブ処理
+        def _process_hls_job(job: dict):
+            job_id = job.get("id")
+            file_id = job.get("file")
+            if not job_id or not file_id:
+                return
+
+            work_dir = Path("work") / ("hls_" + rid_leaf(job_id))
+            try:
+                # ステータスを in_progress へ
+                hls_job_query.set_hls_job_status(self.db_manager, job_id, "in_progress")
+
+                # S3キー取得
+                s3_key = file_query.get_s3key(self.db_manager, file_id)
+
+                # 作業ディレクトリ準備
+                work_dir.mkdir(parents=True, exist_ok=True)
+                filename = s3_key.rstrip("/").split("/")[-1]
+                local_src = work_dir / filename
+
+                # ダウンロード
+                dl_res = self.uploader.download_file(s3_key, str(local_src))
+                if dl_res.status != S3Info.SUCCESS:
+                    raise RuntimeError(f"Download failed: {dl_res.error}")
+
+                # HLS エンコード（out/<uuid>/hls に出力される）
+                hls_out = encode_to_hls(str(local_src), out_dir=str(work_dir / "encoded"), segment_time=6)
+                playlist_path = hls_out["playlist"]
+                seg_paths: List[str] = list(hls_out["segments"])  # includes init + .m4s
+                out_root = Path(hls_out["out_dir"])
+
+                # S3へアップロード（プレイリストとセグメントはファイル名を保持して上げる必要あり）
+                key_prefix = f"hls/{rid_leaf(file_id)}"
+
+                def _relkey(p: str) -> str:
+                    return f"{key_prefix}/" + str(Path(p).relative_to(out_root)).replace("\\", "/")
+
+                # まずプレイリスト
+                playlist_key = f"{key_prefix}/index.m3u8"
+                up_pl = self.uploader.upload_file_as(playlist_path, playlist_key)
+                if up_pl.status != S3Info.SUCCESS:
+                    raise RuntimeError(f"Upload playlist failed: {up_pl.error}")
+                # Register playlist metadata
+                try:
+                    pl_size = Path(playlist_path).stat().st_size
+                except Exception:
+                    pl_size = 0
+                insert_hls_playlist(
+                    self.db_manager,
+                    file_id=file_id,
+                    key=playlist_key,
+                    size=pl_size,
+                    bucket=self.uploader.bucket,
+                    meta={
+                        "kind": "playlist",
+                        "totalSegments": len([p for p in seg_paths if p.endswith('.m4s')]),
+                    },
+                )
+
+                # セグメント群（init.mp4 と *.m4s）
+                up_seg_results = []
+                for p in seg_paths:
+                    up = self.uploader.upload_file_as(p, _relkey(p))
+                    up_seg_results.append(up)
+                if any(r.status != S3Info.SUCCESS for r in up_seg_results):
+                    errs = ", ".join(f"{r.local_path}:{r.error}" for r in up_seg_results if r.status != S3Info.SUCCESS)
+                    raise RuntimeError(f"Upload segments failed: {errs}")
+
+                # DB 登録（各HLSセグメントのメタ情報付与）
+                total_segments = len([p for p in seg_paths if p.endswith('.m4s')])
+                cumulative = 0.0
+                for idx, p in enumerate(seg_paths):
+                    key = _relkey(p)
+                    size = Path(p).stat().st_size
+                    if p.endswith(".m4s"):
+                        info = probe_video(p)
+                        dur = info.get("durationSec") or 0.0
+                        start_sec = cumulative
+                        end_sec = cumulative + dur
+                        cumulative = end_sec
+                        meta = {
+                            "durationSec": dur,
+                            "index": idx,  # includes init as 0, segments start from 1
+                            "total": total_segments,
+                            "kind": "segment",
+                            "startSec": start_sec,
+                            "endSec": end_sec,
+                            "startMin": start_sec / 60.0,
+                            "endMin": end_sec / 60.0,
+                            "width": info.get("width"),
+                            "height": info.get("height"),
+                            "nb_frames": info.get("nb_frames"),
+                            "avg_frame_rate": info.get("avg_frame_rate"),
+                            "codec_name": info.get("codec_name"),
+                        }
+                    else:
+                        meta = {
+                            "durationSec": 0.0,
+                            "index": idx,
+                            "total": total_segments,
+                            "kind": "init",
+                            "startSec": 0.0,
+                            "endSec": 0.0,
+                        }
+                    insert_hls_segment(
+                        self.db_manager,
+                        file_id=file_id,
+                        key=key,
+                        size=size,
+                        bucket=self.uploader.bucket,
+                        meta=meta,
+                    )
+
+                # 完了
+                hls_job_query.set_hls_job_status(self.db_manager, job_id, "complete")
+
+            except Exception as e:
+                try:
+                    hls_job_query.set_hls_job_status(self.db_manager, job_id, "faild")
+                except Exception:
+                    pass
+                print(f"HLS Job {job_id} failed: {e}")
+            finally:
+                try:
+                    if work_dir.exists():
+                        shutil.rmtree(work_dir, ignore_errors=True)
+                except Exception:
+                    pass
+
+        # まず HLS ジョブ
+        if hls_jobs:
+            with ThreadPoolExecutor(max_workers=2) as ex:
+                futures = [ex.submit(_process_hls_job, job) for job in hls_jobs]
+                for _ in as_completed(futures):
+                    pass
+
+        # 次に H264 MP4 セグメントジョブ
         if jobs:
             with ThreadPoolExecutor(max_workers=2) as ex:
                 futures = [ex.submit(_process_job, job) for job in jobs]

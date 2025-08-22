@@ -2,7 +2,7 @@ import subprocess
 import tempfile
 import json
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict
 from dataclasses import dataclass
 from backend_module.uuid_tools import get_uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -188,6 +188,110 @@ def encode_to_segments_links(input_path: str, out_dir: Optional[str] = None) -> 
     """
     paths = encode_to_segments(input_path, out_dir)
     return [f"file://{p}" for p in paths]
+
+
+def encode_to_hls(
+    input_path: str,
+    out_dir: Optional[str] = None,
+    *,
+    segment_time: int = 6,
+    nvenc_quality: Optional[NvencQuality] = None,
+) -> Dict[str, List[str] | str]:
+    """
+    Encode input video to HLS (VOD) with fMP4 segments.
+
+    - Prefers NVENC (h264_nvenc) with recommended quality; falls back to libx264.
+    - Produces: playlist.m3u8, init.mp4, and seg_XXXXX.m4s files in an isolated run directory.
+    - Returns a dict with absolute paths:
+        { 'playlist': <m3u8>, 'segments': [<m4s/... including init.mp4>], 'out_dir': <dir> }
+    """
+    src = Path(input_path)
+    if not src.exists():
+        raise FileNotFoundError(f"Input not found: {src}")
+
+    run_id = get_uuid(16)
+    base_out = Path(out_dir) if out_dir else (src.parent / "out")
+    out_dir_path = base_out / run_id / "hls"
+    out_dir_path.mkdir(parents=True, exist_ok=True)
+
+    # Output names
+    playlist_name = "index.m3u8"
+    init_name = "init.mp4"
+    seg_tpl = str(out_dir_path / "seg_%05d.m4s")
+    playlist_path = str(out_dir_path / playlist_name)
+
+    # Determine quality
+    try:
+        meta = probe_video(str(src))
+    except Exception:
+        meta = {}
+    q = nvenc_quality or _recommend_quality(meta)
+
+    common_hls = [
+        "-an",
+        "-pix_fmt", "yuv420p",
+        "-g", str(q.gop),
+        "-keyint_min", str(q.gop),
+        "-sc_threshold", "0",
+        "-f", "hls",
+        "-hls_time", str(segment_time),
+        "-hls_playlist_type", "vod",
+        "-hls_segment_type", "fmp4",
+        "-hls_fmp4_init_filename", init_name,
+        "-hls_flags", "independent_segments+append_list",
+        "-hls_segment_filename", seg_tpl,
+        playlist_path,
+    ]
+
+    nvenc_cmd = [
+        "ffmpeg", "-y", "-nostdin",
+        "-i", str(src),
+        "-c:v", "h264_nvenc",
+        "-preset", q.preset,
+        "-rc", q.rc,
+        "-b:v", f"{q.target_kbps}k",
+        "-maxrate", f"{q.max_kbps}k",
+        "-bufsize", f"{q.buf_kbps}k",
+        "-profile:v", q.profile,
+        "-rc-lookahead", str(q.rc_lookahead),
+        "-spatial_aq", str(q.spatial_aq),
+        "-temporal_aq", str(q.temporal_aq),
+        "-aq-strength", str(q.aq_strength),
+        "-bf", str(q.b_frames),
+        "-tune", "hq",
+    ] + common_hls
+
+    proc = subprocess.run(nvenc_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if proc.returncode != 0:
+        # Fallback to libx264
+        x264_cmd = [
+            "ffmpeg", "-y", "-nostdin",
+            "-i", str(src),
+            "-c:v", "libx264",
+            "-preset", "slow",
+            "-crf", "18",
+            "-bf", "3",
+        ] + common_hls
+        proc2 = subprocess.run(x264_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if proc2.returncode != 0:
+            raise EncodeError(
+                "ffmpeg HLS failed with NVENC and libx264 fallback:\n"
+                + "--- NVENC stderr ---\n" + (proc.stderr or "")
+                + "\n--- libx264 stderr ---\n" + (proc2.stderr or "")
+            )
+
+    # Collect outputs
+    # Include init.mp4 and all .m4s segments
+    segs = []
+    init_path = out_dir_path / init_name
+    if init_path.exists():
+        segs.append(str(init_path.resolve()))
+    segs.extend(sorted(str(p.resolve()) for p in out_dir_path.glob("seg_*.m4s")))
+
+    if not Path(playlist_path).exists() or len(segs) == 0:
+        raise EncodeError("HLS generation completed but outputs are missing")
+
+    return {"playlist": str(Path(playlist_path).resolve()), "segments": segs, "out_dir": str(out_dir_path.resolve())}
 
 
 def probe_video(path: str) -> dict:
