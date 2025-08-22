@@ -119,31 +119,62 @@ def upload_group_results(
         # Upload per-file artifacts (if provided)
         if it.results_artifacts:
             for art in it.results_artifacts:
-                p = art.get("parquet")
                 fid = str(art.get("file_id")) if art.get("file_id") is not None else None
-                if not p or not fid or not Path(p).exists():
+                if not fid:
                     continue
-                key = (
-                    f"inference/{job_leaf}/group_{it.index:03d}/"
-                    f"{add_uuid_prefix(f'{Path(fid).name}_results.parquet')}"
-                )
-                up = uploader.upload_file_as(p, key)
-                if up.status == S3Info.SUCCESS:
-                    size = Path(p).stat().st_size
-                    insert_inference_result(
-                        db_manager,
-                        job_id=job_id,
-                        dataset=it.dataset,
-                        files=[fid],
-                        key=key,
-                        bucket=uploader.bucket,
-                        size=size,
-                        labels=[],
-                        meta={
-                            "groupIndex": it.index,
-                            "sourceFiles": [fid],
-                            "artifact": "results_parquet",
-                            "contentType": "application/x-parquet",
-                            **({"description": art.get("description")} if art.get("description") else {}),
-                        },
+
+                # 1) Per-file results parquet
+                p = art.get("parquet")
+                if p and Path(p).exists():
+                    key = (
+                        f"inference/{job_leaf}/group_{it.index:03d}/"
+                        f"{add_uuid_prefix(f'{Path(fid).name}_results.parquet')}"
                     )
+                    up = uploader.upload_file_as(p, key)
+                    if up.status == S3Info.SUCCESS:
+                        size = Path(p).stat().st_size
+                        insert_inference_result(
+                            db_manager,
+                            job_id=job_id,
+                            dataset=it.dataset,
+                            files=[fid],
+                            key=key,
+                            bucket=uploader.bucket,
+                            size=size,
+                            labels=[],
+                            meta={
+                                "groupIndex": it.index,
+                                "sourceFiles": [fid],
+                                "artifact": "results_parquet",
+                                "contentType": "application/x-parquet",
+                                **({"description": art.get("description")} if art.get("description") else {}),
+                            },
+                        )
+
+                # 2) Per-file timelapse plot video (optional)
+                tl = art.get("timelapse_plot")
+                if tl and Path(tl).exists():
+                    key = (
+                        f"inference/{job_leaf}/group_{it.index:03d}/"
+                        f"{add_uuid_prefix(f'{Path(fid).name}_timelapse_plot.mp4')}"
+                    )
+                    up = uploader.upload_file_as(tl, key)
+                    if up.status == S3Info.SUCCESS:
+                        size = Path(tl).stat().st_size
+                        insert_inference_result(
+                            db_manager,
+                            job_id=job_id,
+                            dataset=it.dataset,
+                            files=[fid],
+                            key=key,
+                            bucket=uploader.bucket,
+                            size=size,
+                            labels=[],
+                            meta={
+                                "groupIndex": it.index,
+                                "sourceFiles": [fid],
+                                "artifact": "plot_video",
+                                "contentType": "video/mp4",
+                                **({"description": art.get("timelapse_description") or art.get("description")} if (art.get("timelapse_description") or art.get("description")) else {}),
+                            },
+                        )

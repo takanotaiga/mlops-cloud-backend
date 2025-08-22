@@ -109,7 +109,10 @@ def _plot_from_parquet(frames_dir: str, results_parquet: str, *,
             bbox_map: Dict[int, Tuple[int, int, int, int]] = {}
             labels_by_id: Dict[int, str] = {}
             try:
-                g = groups.get_group(fi)
+                if isinstance(groups, dict):
+                    g = None
+                else:
+                    g = groups.get_group(fi)
             except Exception:
                 g = None
             if g is not None:
@@ -127,9 +130,87 @@ def _plot_from_parquet(frames_dir: str, results_parquet: str, *,
                 cv2.rectangle(img, (x, y), (x + w, y + h), c, 2)
                 text = labels_by_id.get(obj_id, f"id:{obj_id}")
                 cv2.putText(img, text, (x, max(0, y - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, c, 2, lineType=cv2.LINE_AA)
+
+            # Draw frame index at top-left
+            try:
+                idx_text = f"frame: {fi}"
+                (tw, th), _ = cv2.getTextSize(idx_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+                x0, y0 = 8, 10 + th
+                cv2.rectangle(img, (x0 - 6, y0 - th - 6), (x0 + tw + 6, y0 + 6), (0, 0, 0), -1)
+                cv2.putText(img, idx_text, (x0, y0), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, lineType=cv2.LINE_AA)
+            except Exception:
+                pass
             writer.write(img)
     finally:
         writer.release()
+
+    return out_path
+
+
+def _plot_on_video_from_parquet(video_path: str, results_parquet: str, out_path: str) -> str:
+    """
+    Overlay RT-DETR bbox results (parquet) onto a single concatenated video.
+
+    Assumes parquet has columns: frame_index (0-based), x, y, w, h, label.
+    """
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise RuntimeError(f"Failed to open video: {video_path}")
+
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
+
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(out_path, fourcc, fps or 30.0, (width, height))
+
+    try:
+        df = pd.read_parquet(results_parquet)
+        if "frame_index" in df.columns:
+            groups = df.groupby("frame_index")
+        else:
+            groups = {}
+
+        fi = 0
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            try:
+                g = groups.get_group(fi)
+            except Exception:
+                g = None
+
+            if g is not None:
+                for _, row in g.iterrows():
+                    try:
+                        x, y, w, h = int(row["x"]), int(row["y"]), int(row["w"]), int(row["h"])
+                        if w <= 0 or h <= 0:
+                            continue
+                        # color by label hash for stability across frames
+                        lbl = str(row["label"]) if not pd.isna(row.get("label")) else "obj"
+                        hv = abs(hash(lbl)) % 255
+                        color = (int((50 + 2 * hv) % 255), int((120 + hv) % 255), int((200 + 3 * hv) % 255))
+                        cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
+                        cv2.putText(frame, lbl, (x, max(0, y - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, lineType=cv2.LINE_AA)
+                    except Exception:
+                        continue
+
+            # Draw frame index at top-left of the original video
+            try:
+                idx_text = f"frame: {fi}"
+                (tw, th), _ = cv2.getTextSize(idx_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+                x0, y0 = 8, 10 + th
+                cv2.rectangle(frame, (x0 - 6, y0 - th - 6), (x0 + tw + 6, y0 + 6), (0, 0, 0), -1)
+                cv2.putText(frame, idx_text, (x0, y0), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, lineType=cv2.LINE_AA)
+            except Exception:
+                pass
+
+            writer.write(frame)
+            fi += 1
+    finally:
+        writer.release()
+        cap.release()
 
     return out_path
 
@@ -317,6 +398,18 @@ class SamuraiULRModel:
             except Exception:
                 pass
 
+            # Plotting for timelapse (kept for reference; not used as final output)
+            tl_out_path = str(work / f"{Path(str(fid)).name}_tracked_timelapse.mp4")
+            _plot_from_parquet(
+                frames_dir,
+                parquet_path,
+                frame_count=frame_count,
+                width=width,
+                height=height,
+                fps=fps,
+                out_path=tl_out_path,
+            )
+
             # Record artifact paths for upload by the caller
             results_artifacts.append({
                 "file_id": str(fid),
@@ -324,15 +417,12 @@ class SamuraiULRModel:
                 "parquet": parquet_path,
                 # Description to be propagated to DB metadata
                 "description": "タイムラプス動画のSAM2推論結果",
+                # Also upload the timelapse plot video per file
+                "timelapse_plot": tl_out_path,
+                "timelapse_description": "タイムラプスフレームにSAM2検出を重畳した動画",
             })
 
-            # Plotting: read saved results and overlay per-frame bboxes
-            out_path = str(work / f"{Path(str(fid)).name}_tracked.mp4")
-            _plot_from_parquet(frames_dir, parquet_path,
-                               frame_count=frame_count, width=width, height=height, fps=fps,
-                               out_path=out_path)
-
-            per_file_outputs.append(out_path)
+            # Keep labels for group summary
             per_file_labels.extend([s.label for s in seeds])
 
             # 2) YOLO dataset export from SAM2 results (timelapse frames + parquet)
@@ -629,6 +719,24 @@ class SamuraiULRModel:
                     group_pq = str(work / f"{Path(str(fid)).name}_infer_merged.parquet")
                     df_all.to_parquet(group_pq, index=False)
                     group_parquet_paths.append(group_pq)
+
+                    # Create a single RT-DETR overlay plot on the concatenated original video
+                    concat_path = str(work / f"{Path(str(fid)).name}_concat.mp4")
+                    try:
+                        concat_videos(seg_paths, concat_path)
+                    except Exception:
+                        # Best-effort fallback to first segment
+                        concat_path = seg_paths[0]
+                    try:
+                        rtdetr_plot_path = str(work / f"{Path(str(fid)).name}_rtdetr_tracked.mp4")
+                        _plot_on_video_from_parquet(concat_path, group_pq, rtdetr_plot_path)
+                        per_file_outputs.append(rtdetr_plot_path)
+                    except Exception:
+                        # If overlay fails, fallback to timelapse plot created earlier
+                        try:
+                            per_file_outputs.append(tl_out_path)
+                        except Exception:
+                            pass
                 except Exception:
                     pass
                 finally:
@@ -674,6 +782,6 @@ class SamuraiULRModel:
             "group_parquet": group_parquet,
             "temp_datasets": sorted(set(temp_datasets)),
             # Human-readable descriptions propagated to uploader
-            "video_description": "タイムラプス動画にSAM2の推論結果をプロットした動画",
+            "video_description": "連結動画にRT-DETRの推論結果をプロットした動画",
             "group_parquet_description": "全ての動画に対する最終推論結果",
         }
