@@ -165,10 +165,9 @@ class MLInferenceRunner:
             dataset = mg.get("dataset")
             members = mg.get("members") or []
             # Resolve member names to file ids (filtering missing)
+            # Preserve the order declared in merge_group.members
             member_fids = [files_by_dataset_name.get(dataset, {}).get(name) for name in members]
             member_fids = [fid for fid in member_fids if fid]
-            # Sort concatenation order by original file name
-            member_fids.sort(key=lambda fid: (file_name_by_id.get(fid) or ""))
 
             seq = 1
             group_list: list[list[object]] = []

@@ -17,6 +17,7 @@ class S3Info(IntEnum):
     UPLOAD_FAILED = auto()
     DOWNLOAD_FAILED = auto()
     OBJECT_NOT_FOUND = auto()
+    DELETE_FAILED = auto()
 
 @dataclass
 class UploadResult:
@@ -30,6 +31,13 @@ class UploadResult:
 class DownloadResult:
     key: str
     local_path: Optional[str]
+    status: S3Info
+    error: Optional[str] = None
+
+
+@dataclass
+class DeleteResult:
+    key: str
     status: S3Info
     error: Optional[str] = None
 
@@ -269,6 +277,63 @@ class MinioS3Uploader:
         for chunk in body.iter_chunks(chunk_size):
             if chunk:
                 yield chunk
+
+    # --------- delete API ---------
+
+    def delete_key(self, key: str) -> DeleteResult:
+        """Delete a single object key. Returns DeleteResult.
+
+        Note: S3 delete is idempotent; deleting a non-existent key is treated as success.
+        """
+        try:
+            self.s3.delete_object(Bucket=self.bucket, Key=key)
+            return DeleteResult(key=key, status=S3Info.SUCCESS)
+        except (ClientError, BotoCoreError) as e:
+            # Treat NotFound as success (idempotent semantics)
+            code = getattr(e, "response", {}).get("Error", {}).get("Code") if hasattr(e, "response") else None
+            if code in {"404", "NoSuchKey", "NotFound"}:
+                return DeleteResult(key=key, status=S3Info.SUCCESS)
+            return DeleteResult(key=key, status=S3Info.DELETE_FAILED, error=str(e))
+        except Exception as e:
+            return DeleteResult(key=key, status=S3Info.DELETE_FAILED, error=str(e))
+
+    def delete_keys(self, keys: Iterable[str], *, batch_size: int = 1000) -> List[DeleteResult]:
+        """Delete multiple keys using S3's DeleteObjects API in batches.
+
+        - Batches up to 1000 keys per request as per S3 limits.
+        - Returns a DeleteResult per input key.
+        - Missing keys are considered success (idempotent).
+        """
+        keys_list = [k for k in keys if isinstance(k, str) and k]
+        results: List[DeleteResult] = []
+        if not keys_list:
+            return results
+
+        # Process in batches
+        for i in range(0, len(keys_list), batch_size):
+            batch = keys_list[i : i + batch_size]
+            try:
+                resp = self.s3.delete_objects(
+                    Bucket=self.bucket,
+                    Delete={"Objects": [{"Key": k} for k in batch], "Quiet": True},
+                )
+                # According to S3, with Quiet=True, 'Errors' may still be present
+                deleted_set = set(k for k in batch)
+                errors = {e.get("Key"): e for e in resp.get("Errors", [])} if isinstance(resp, dict) else {}
+                for k in batch:
+                    if k in errors:
+                        results.append(DeleteResult(key=k, status=S3Info.DELETE_FAILED, error=str(errors[k])))
+                    else:
+                        results.append(DeleteResult(key=k, status=S3Info.SUCCESS))
+            except (ClientError, BotoCoreError) as e:
+                # Fall back to per-key deletion for this batch
+                for k in batch:
+                    results.append(self.delete_key(k))
+            except Exception:
+                # As a safety, try per-key to provide best-effort results
+                for k in batch:
+                    results.append(self.delete_key(k))
+        return results
 
     # --------- helper ---------
 
