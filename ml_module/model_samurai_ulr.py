@@ -264,6 +264,14 @@ class SamuraiULRModel:
         infer_started = False
         dataset_started = False
 
+        # Group-level controls
+        per_file_infer_enabled = False  # Disable per-file inference; run once over merged group instead
+        global_model_path: Optional[str] = None  # Model chosen from first successful train/export
+        # Flatten all original segments across the group in member order
+        group_seg_paths: List[str] = []
+        for it in file_group:
+            group_seg_paths.extend(list(it.get("segments") or []))
+
         for item in file_group:
             fid = item.get("file_id")
             segs = item.get("segments") or []
@@ -275,13 +283,15 @@ class SamuraiULRModel:
                     tracker.start("preprocess") if tracker else None
                 except Exception:
                     pass
-            merged = str(work / f"{Path(str(fid)).name}_merged_timelapse.mp4")
-            try:
-                _merged_path, _step = timelapse_merge(segs, merged, max_frames=16384, max_workers=4)
-            except Exception as e:
-                # If timelapse fails, fall back to simple concat (may still fail due to frame cap)
-                merged = str(work / f"{Path(str(fid)).name}_merged.mp4")
-                concat_videos(segs, merged)
+            # Build a single timelapse video for the whole merge group (only once)
+            merged = str(work / "group_merged_timelapse.mp4")
+            if not os.path.exists(merged):
+                try:
+                    _merged_path, _step = timelapse_merge(group_seg_paths, merged, max_frames=16384, max_workers=4)
+                except Exception as e:
+                    # If timelapse fails, fall back to simple concat (may still fail due to frame cap)
+                    merged = str(work / "group_merged.mp4")
+                    concat_videos(group_seg_paths, merged)
 
             # fetch seed boxes from annotations for this file
             anns = get_key_bboxes_for_file(db_manager, fid)
@@ -295,12 +305,14 @@ class SamuraiULRModel:
                     ))
                 except Exception:
                     continue
+            # Proceed with SAM2/dataset/train only if we have seeds and no model selected yet
             if not seeds:
-                # if no seeds, skip this file
+                # No seeds on this file; move on to next file (training remains pending)
                 continue
 
             # Extract frames once for this file (from timelapse-merged video)
-            frames_dir = str(work / f"{Path(str(fid)).name}_frames")
+            # Extract frames from the group-level merged timelapse
+            frames_dir = str(work / "group_frames")
             _ensure_dir(frames_dir)
             # Pre-check total frames; reject >= 16384
             total_fc = _get_total_frame_count(merged)
@@ -331,7 +343,7 @@ class SamuraiULRModel:
                 x1 = max(0, min(width - 1, int(max(seed.x1, seed.x2) * width)))
                 y1 = max(0, min(height - 1, int(max(seed.y1, seed.y2) * height)))
 
-                out_json = work / f"{Path(str(fid)).name}_seed{si:03d}_sam2.json"
+                out_json = work / f"group_seed{si:03d}_sam2.json"
                 cmd = [
                     "python3", "-m", "ml_module.cli_infer_samrai",
                     "--images", str(frames_dir),
@@ -352,8 +364,8 @@ class SamuraiULRModel:
                 except Exception:
                     continue
 
-            # Merge per-seed parquet files and add metadata columns
-            parquet_path = str(work / f"{Path(str(fid)).name}_results.parquet")
+            # Merge per-seed parquet files and add metadata columns for the whole group
+            parquet_path = str(work / "group_results.parquet")
             dfs = []
             for si, pqp in enumerate(per_seed_parquets):
                 try:
@@ -368,6 +380,7 @@ class SamuraiULRModel:
                         df["area"] = (df["w"].astype(int) * df["h"].astype(int)).astype(int)
                     except Exception:
                         df["area"] = 0
+                # Attribute to the first seeded file for metadata purposes
                 df["file_id"] = str(fid)
                 df["video_name"] = str(item.get("name") or "")
                 df["seed_index"] = int(si)
@@ -399,7 +412,7 @@ class SamuraiULRModel:
                 pass
 
             # Plotting for timelapse (kept for reference; not used as final output)
-            tl_out_path = str(work / f"{Path(str(fid)).name}_tracked_timelapse.mp4")
+            tl_out_path = str(work / "group_tracked_timelapse.mp4")
             _plot_from_parquet(
                 frames_dir,
                 parquet_path,
@@ -409,6 +422,11 @@ class SamuraiULRModel:
                 fps=fps,
                 out_path=tl_out_path,
             )
+            # Keep per-file timelapse plot as a fallback visual output
+            try:
+                per_file_outputs.append(tl_out_path)
+            except Exception:
+                pass
 
             # Record artifact paths for upload by the caller
             results_artifacts.append({
@@ -416,10 +434,10 @@ class SamuraiULRModel:
                 "name": str(item.get("name") or ""),
                 "parquet": parquet_path,
                 # Description to be propagated to DB metadata
-                "description": "タイムラプス動画のSAM2推論結果",
-                # Also upload the timelapse plot video per file
+                "description": "タイムラプス動画のSAM2推論結果（グループ全体）",
+                # Also upload the timelapse plot video for the group
                 "timelapse_plot": tl_out_path,
-                "timelapse_description": "タイムラプスフレームにSAM2検出を重畳した動画",
+                "timelapse_description": "グループ連結タイムラプスにSAM2検出を重畳した動画",
             })
 
             # Keep labels for group summary
@@ -536,35 +554,39 @@ class SamuraiULRModel:
                     except Exception:
                         pass
                     dataset_started = True
+            except Exception:
+                # Dataset export is best-effort; continue even if it fails
+                pass
 
-                # 3) Train RT-DETR via CLI and optionally export TensorRT
-                if not train_started:
-                    try:
-                        # Transition SAM2 -> RT-DETR train on first encounter
-                        tracker.complete("sam2") if tracker else None
-                        tracker.start("rtdetr_train") if tracker else None
-                    except Exception:
-                        pass
-                    train_started = True
-                train_out = Path(work) / f"train_result_{Path(str(fid)).name}"
-                train_json = Path(work) / f"train_result_{Path(str(fid)).name}.json"
-                rc = cmd_exec([
-                    "python3", "-m", "ml_module.cli_train_rtdetr",
-                    # Pass absolute path under /workspace/src/datasets
-                    "--dataset", str(dataset_root),
-                    "--out-dir", str(train_out),
-                    "--epochs", str(8),
-                    "--base-model", "rtdetr-l.pt",
-                    "--result", str(train_json),
-                ])
-                if rc == 0 and train_json.exists():
-                    import json
-                    with open(train_json, "r", encoding="utf-8") as f:
-                        train_res = json.load(f)
-                    model_pt = train_res.get("pt")
-                else:
-                    model_pt = None
+            # 3) Train RT-DETR via CLI and optionally export TensorRT
+            if not train_started:
+                try:
+                    # Transition SAM2 -> RT-DETR train on first encounter
+                    tracker.complete("sam2") if tracker else None
+                    tracker.start("rtdetr_train") if tracker else None
+                except Exception:
+                    pass
+                train_started = True
+            train_out = Path(work) / f"train_result_{Path(str(fid)).name}"
+            train_json = Path(work) / f"train_result_{Path(str(fid)).name}.json"
+            rc = cmd_exec([
+                "python3", "-m", "ml_module.cli_train_rtdetr",
+                # Pass absolute path under /workspace/src/datasets
+                "--dataset", str(dataset_root),
+                "--out-dir", str(train_out),
+                "--epochs", str(8),
+                "--base-model", "rtdetr-l.pt",
+                "--result", str(train_json),
+            ])
+            if rc == 0 and train_json.exists():
+                import json
+                with open(train_json, "r", encoding="utf-8") as f:
+                    train_res = json.load(f)
+                model_pt = train_res.get("pt")
+            else:
+                model_pt = None
 
+            try:
                 model_engine = None
                 print("DEBUG: [model_pt]")
                 if model_pt:
@@ -633,25 +655,30 @@ class SamuraiULRModel:
                 # If training/export fails, skip downstream inference
                 model_path = None
 
-            # 4) Inference on original segments in parallel -> per-segment parquet, then merge
+            # Capture model path for later group-level inference
+            if model_path and (global_model_path is None):
+                global_model_path = model_path
+
+        # After preparing model (from first seeded file), run inference once over the entire group
+        final_path: Optional[str] = None
+        group_parquet: Optional[str] = None
+        if global_model_path and group_seg_paths:
             if not infer_started:
                 try:
-                    # Transition RT-DETR train -> RT-DETR inference
                     tracker.complete("rtdetr_train") if (tracker and train_started) else None
                     tracker.start("rtdetr_infer") if tracker else None
                 except Exception:
                     pass
                 infer_started = True
-            def _infer_one(seg_path: str, seg_index: int) -> Optional[Tuple[int, str]]:
+
+            def _infer_one_group(seg_path: str, seg_index: int) -> Optional[Tuple[int, str]]:
                 try:
-                    if not model_path:
-                        return None
-                    out_parquet = str(work / f"{Path(str(fid)).name}_seg{seg_index:03d}_infer.parquet")
-                    out_video = str(work / f"{Path(str(fid)).name}_seg{seg_index:03d}_infer.mp4")
-                    out_json = str(work / f"{Path(str(fid)).name}_seg{seg_index:03d}_infer.json")
+                    out_parquet = str(work / f"group_seg{seg_index:03d}_infer.parquet")
+                    out_video = str(work / f"group_seg{seg_index:03d}_infer.mp4")
+                    out_json = str(work / f"group_seg{seg_index:03d}_infer.json")
                     rc = cmd_exec([
                         "python3", "-m", "ml_module.cli_infer_rtdetr",
-                        "--model", str(model_path),
+                        "--model", str(global_model_path),
                         "--video", str(seg_path),
                         "--out-parquet", out_parquet,
                         "--out-video", out_video,
@@ -663,99 +690,88 @@ class SamuraiULRModel:
                 except Exception:
                     return None
 
-            seg_paths = list(segs)
-            # Collect results with their original indices to preserve order
-            seg_results: Dict[int, str] = {}
-            if model_path and seg_paths:
-                with ThreadPoolExecutor(max_workers=10) as ex:
-                    futs = [ex.submit(_infer_one, sp, si) for si, sp in enumerate(seg_paths)]
-                    for fu in as_completed(futs):
-                        r = fu.result()
-                        if r and isinstance(r, tuple) and len(r) == 2:
-                            si, p = r
-                            if isinstance(si, int) and isinstance(p, str):
-                                seg_results[si] = p
+            seg_results_all: Dict[int, str] = {}
+            with ThreadPoolExecutor(max_workers=10) as ex:
+                futs = [ex.submit(_infer_one_group, sp, si) for si, sp in enumerate(group_seg_paths)]
+                for fu in as_completed(futs):
+                    r = fu.result()
+                    if r and isinstance(r, tuple) and len(r) == 2:
+                        si, p = r
+                        if isinstance(si, int) and isinstance(p, str):
+                            seg_results_all[si] = p
 
-            # Merge segment parquets into group-level parquet for this file
+            # Aggregate across all segments in the group
             aggregate_started = False
-            if seg_paths:
+            try:
+                if not aggregate_started:
+                    try:
+                        tracker.start("aggregate") if tracker else None
+                    except Exception:
+                        pass
+                seg_frame_counts: List[int] = []
+                for sp in group_seg_paths:
+                    try:
+                        seg_frame_counts.append(_get_total_frame_count(sp))
+                    except Exception:
+                        seg_frame_counts.append(0)
+                offsets: List[int] = []
+                total = 0
+                for cnt in seg_frame_counts:
+                    offsets.append(total)
+                    total += int(cnt or 0)
+
+                dfs_all: List[pd.DataFrame] = []
+                for si in range(len(group_seg_paths)):
+                    p = seg_results_all.get(si)
+                    if not p:
+                        continue
+                    try:
+                        df = pd.read_parquet(p)
+                    except Exception:
+                        continue
+                    if "frame_index" in df.columns:
+                        try:
+                            df["frame_index"] = df["frame_index"].astype(int) + int(offsets[si])
+                        except Exception:
+                            pass
+                    dfs_all.append(df)
+
+                df_all = pd.concat(dfs_all, ignore_index=True) if dfs_all else pd.DataFrame()
+                group_parquet = str(work / "group_infer_merged.parquet")
+                df_all.to_parquet(group_parquet, index=False)
+                group_parquet_paths.append(group_parquet)
+
+                # Overlay on fully concatenated original video
+                concat_path = str(work / "group_concat.mp4")
                 try:
-                    if not aggregate_started:
-                        try:
-                            tracker.start("aggregate") if tracker else None
-                        except Exception:
-                            pass
-                    # Compute cumulative frame offsets for each segment using video frame counts
-                    seg_frame_counts: List[int] = []
-                    for sp in seg_paths:
-                        try:
-                            seg_frame_counts.append(_get_total_frame_count(sp))
-                        except Exception:
-                            seg_frame_counts.append(0)
-                    offsets: List[int] = []
-                    total = 0
-                    for cnt in seg_frame_counts:
-                        offsets.append(total)
-                        total += int(cnt or 0)
-
-                    # Read each available parquet and offset its frame_index by cumulative frames
-                    dfs: List[pd.DataFrame] = []
-                    for si in range(len(seg_paths)):
-                        p = seg_results.get(si)
-                        if not p:
-                            continue
-                        try:
-                            df = pd.read_parquet(p)
-                        except Exception:
-                            continue
-                        if "frame_index" in df.columns:
-                            try:
-                                df["frame_index"] = df["frame_index"].astype(int) + int(offsets[si])
-                            except Exception:
-                                pass
-                        dfs.append(df)
-
-                    df_all = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
-                    group_pq = str(work / f"{Path(str(fid)).name}_infer_merged.parquet")
-                    df_all.to_parquet(group_pq, index=False)
-                    group_parquet_paths.append(group_pq)
-
-                    # Create a single RT-DETR overlay plot on the concatenated original video
-                    concat_path = str(work / f"{Path(str(fid)).name}_concat.mp4")
-                    try:
-                        concat_videos(seg_paths, concat_path)
-                    except Exception:
-                        # Best-effort fallback to first segment
-                        concat_path = seg_paths[0]
-                    try:
-                        rtdetr_plot_path = str(work / f"{Path(str(fid)).name}_rtdetr_tracked.mp4")
-                        _plot_on_video_from_parquet(concat_path, group_pq, rtdetr_plot_path)
-                        per_file_outputs.append(rtdetr_plot_path)
-                    except Exception:
-                        # If overlay fails, fallback to timelapse plot created earlier
-                        try:
-                            per_file_outputs.append(tl_out_path)
-                        except Exception:
-                            pass
+                    concat_videos(group_seg_paths, concat_path)
                 except Exception:
-                    pass
-                finally:
-                    if not aggregate_started:
-                        try:
-                            tracker.complete("aggregate") if tracker else None
-                        except Exception:
-                            pass
-                        aggregate_started = True
+                    if group_seg_paths:
+                        concat_path = group_seg_paths[0]
+                try:
+                    final_path = str(work / "group_rtdetr_tracked.mp4")
+                    _plot_on_video_from_parquet(concat_path, group_parquet, final_path)
+                except Exception:
+                    final_path = concat_path
+            except Exception:
+                pass
+            finally:
+                if not aggregate_started:
+                    try:
+                        tracker.complete("aggregate") if tracker else None
+                    except Exception:
+                        pass
+                    aggregate_started = True
 
-        if not per_file_outputs:
-            return {"output_path": None, "labels": [], "results_artifacts": results_artifacts}
-
-        # concat per-file outputs if more than one
-        if len(per_file_outputs) > 1:
-            final_path = str(work / "group_tracked.mp4")
-            concat_videos(per_file_outputs, final_path)
-        else:
-            final_path = per_file_outputs[0]
+        # If we could not produce a final group-level video, fallback to previous per-file outputs
+        if not final_path:
+            if not per_file_outputs:
+                return {"output_path": None, "labels": [], "results_artifacts": results_artifacts}
+            if len(per_file_outputs) > 1:
+                final_path = str(work / "group_tracked.mp4")
+                concat_videos(per_file_outputs, final_path)
+            else:
+                final_path = per_file_outputs[0]
 
         # If any group parquet exists, select the first for upload at group level
         group_parquet = group_parquet_paths[0] if group_parquet_paths else None

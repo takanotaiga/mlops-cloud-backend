@@ -10,3 +10,4 @@ datasets
 *.jpeg
 *.json
 *.parquet
+*.pyc
