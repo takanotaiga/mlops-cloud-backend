@@ -32,6 +32,9 @@ jobs:
           - name: sm
             file: Dockerfile.sm
             image_suffix: -sm
+          - name: cm
+            file: Dockerfile.cm
+            image_suffix: -cm
     permissions:
       contents: read
       packages: write
