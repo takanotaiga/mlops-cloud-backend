@@ -3,31 +3,12 @@ import tempfile
 import json
 from pathlib import Path
 from typing import List, Optional, Tuple, Dict
-from dataclasses import dataclass
 from backend_module.uuid_tools import get_uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 class EncodeError(Exception):
     """Raised when ffmpeg encoding fails."""
-
-
-@dataclass
-class NvencQuality:
-    # 目標/上限/バッファ（kbps）
-    target_kbps: int
-    max_kbps: int
-    buf_kbps: int
-    # 品質関連
-    preset: str = "p5"  # p1..p7（大きいほど高品質・低速）
-    profile: str = "high"
-    rc: str = "vbr_hq"  # vbr_hq が高品質
-    rc_lookahead: int = 32
-    spatial_aq: int = 1
-    temporal_aq: int = 1
-    aq_strength: int = 8  # 0..15 推奨8-12
-    b_frames: int = 3
-    gop: int = 240
 
 
 def _parse_fps(s: Optional[str]) -> Optional[float]:
@@ -42,27 +23,16 @@ def _parse_fps(s: Optional[str]) -> Optional[float]:
         return None
 
 
-def _recommend_quality(meta: dict) -> NvencQuality:
-    width = meta.get("width") or 1920
-    fps = _parse_fps(meta.get("avg_frame_rate")) or 30.0
-    # 高動き前提でやや高めのビットレートを推奨
-    if width >= 3800 or fps >= 50:
-        return NvencQuality(target_kbps=50000, max_kbps=65000, buf_kbps=130000, preset="p5")
-    if width >= 2560:
-        return NvencQuality(target_kbps=24000, max_kbps=32000, buf_kbps=64000, preset="p5")
-    if width >= 1920:
-        return NvencQuality(target_kbps=12000, max_kbps=18000, buf_kbps=36000, preset="p5")
-    if width >= 1280:
-        return NvencQuality(target_kbps=7000, max_kbps=10000, buf_kbps=20000, preset="p5")
-    return NvencQuality(target_kbps=4000, max_kbps=6000, buf_kbps=12000, preset="p5")
+GOP_DEFAULT = 240
 
 
-def encode_to_segments(input_path: str, out_dir: Optional[str] = None, *, nvenc_quality: Optional[NvencQuality] = None) -> List[str]:
+def encode_to_segments(input_path: str, out_dir: Optional[str] = None) -> List[str]:
     """
     指定された動画ファイルをffmpegで分割エンコードし、生成されたファイルの絶対パスを返す。
 
-    実行コマンド（NVENC使用）:
-    ffmpeg -y -nostdin -i INPUT -an -c:v h264_nvenc -preset p4 \
+    実行コマンド（NVENC使用, HEVC）例:
+    ffmpeg -y -nostdin -i INPUT -an -c:v hevc_nvenc -preset p1 -rc vbr -crf 24 \
+        -rc-lookahead 20 -spatial_aq 1 -temporal_aq 1 -aq-strength 8 -bf 0 -g 240 -tune hq -pix_fmt yuv420p \
         -f segment -segment_time 180 -reset_timestamps 1 OUT_DIR/out_%03d.mp4
 
     例外は呼び出し側のtry/exceptで扱う想定。
@@ -81,14 +51,7 @@ def encode_to_segments(input_path: str, out_dir: Optional[str] = None, *, nvenc_
     # 出力テンプレート
     out_tpl = str(out_dir_path / "out_%03d.mp4")
 
-    # 入力メタから品質推奨を決定
-    try:
-        meta = probe_video(str(src))
-    except Exception:
-        meta = {}
-    q = nvenc_quality or _recommend_quality(meta)
-
-    # まず NVENC で試行。失敗したら libx264 にフォールバック。
+    # まず NVENC(HEVC) で試行。失敗したら libx265 にフォールバック。
     nvenc_cmd = [
         "ffmpeg",
         "-y",
@@ -97,35 +60,19 @@ def encode_to_segments(input_path: str, out_dir: Optional[str] = None, *, nvenc_
         str(src),
         "-an",
         "-c:v",
-        "h264_nvenc",
-        "-preset",
-        q.preset,
-        "-rc",
-        q.rc,
-        "-b:v",
-        f"{q.target_kbps}k",
-        "-maxrate",
-        f"{q.max_kbps}k",
-        "-bufsize",
-        f"{q.buf_kbps}k",
-        "-profile:v",
-        q.profile,
-        "-rc-lookahead",
-        str(q.rc_lookahead),
-        "-spatial_aq",
-        str(q.spatial_aq),
-        "-temporal_aq",
-        str(q.temporal_aq),
-        "-aq-strength",
-        str(q.aq_strength),
-        "-bf",
-        str(q.b_frames),
-        "-g",
-        str(q.gop),
-        "-tune",
-        "hq",
-        "-pix_fmt",
-        "yuv420p",
+        "hevc_nvenc",
+        # サンプルに合わせた HEVC NVENC プリセット
+        "-preset", "p1",
+        "-rc", "vbr",
+        "-crf", "24",
+        "-rc-lookahead", "20",
+        "-spatial_aq", "1",
+        "-temporal_aq", "1",
+        "-aq-strength", "8",
+        "-bf", "0",
+        "-g", "240",
+        "-tune", "hq",
+        "-pix_fmt", "yuv420p",
         "-f",
         "segment",
         "-segment_time",
@@ -137,7 +84,7 @@ def encode_to_segments(input_path: str, out_dir: Optional[str] = None, *, nvenc_
 
     proc = subprocess.run(nvenc_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if proc.returncode != 0:
-        # NVENC が使えない場合（10bitやGPU非搭載）はCPUエンコードへ切替
+        # NVENC が使えない場合（10bitやGPU非搭載）はCPUエンコード(HEVC)へ切替
         print("CHANGED CPU ENCODE MODE")
         x264_cmd = [
             "ffmpeg",
@@ -147,17 +94,12 @@ def encode_to_segments(input_path: str, out_dir: Optional[str] = None, *, nvenc_
             str(src),
             "-an",
             "-c:v",
-            "libx264",
-            "-preset",
-            "slow",
-            "-crf",
-            "18",
-            "-bf",
-            "3",
-            "-g",
-            "240",
-            "-pix_fmt",
-            "yuv420p",
+            "libx265",
+            "-preset", "ultrafast",
+            "-crf", "24",
+            "-bf", "0",
+            "-g", "240",
+            "-pix_fmt", "yuv420p",
             "-f",
             "segment",
             "-segment_time",
@@ -170,9 +112,9 @@ def encode_to_segments(input_path: str, out_dir: Optional[str] = None, *, nvenc_
         if proc2.returncode != 0:
             # 両方失敗した場合のみ失敗を返す（NVENC のログを含める）
             raise EncodeError(
-                "ffmpeg failed with NVENC and libx264 fallback:\n"
+                "ffmpeg failed with NVENC(hevc_nvenc) and libx265 fallback:\n"
                 + "--- NVENC stderr ---\n" + (proc.stderr or "")
-                + "\n--- libx264 stderr ---\n" + (proc2.stderr or "")
+                + "\n--- libx265 stderr ---\n" + (proc2.stderr or "")
             )
 
     # 生成ファイルを列挙
@@ -195,12 +137,11 @@ def encode_to_hls(
     out_dir: Optional[str] = None,
     *,
     segment_time: int = 6,
-    nvenc_quality: Optional[NvencQuality] = None,
 ) -> Dict[str, List[str] | str]:
     """
     Encode input video to HLS (VOD) with fMP4 segments.
 
-    - Prefers NVENC (h264_nvenc) with recommended quality; falls back to libx264.
+    - Prefers NVENC (hevc_nvenc) with HEVC sample-like settings; falls back to libx265.
     - Produces: playlist.m3u8, init.mp4, and seg_XXXXX.m4s files in an isolated run directory.
     - Returns a dict with absolute paths:
         { 'playlist': <m3u8>, 'segments': [<m4s/... including init.mp4>], 'out_dir': <dir> }
@@ -220,18 +161,14 @@ def encode_to_hls(
     seg_tpl = str(out_dir_path / "seg_%05d.m4s")
     playlist_path = str(out_dir_path / playlist_name)
 
-    # Determine quality
-    try:
-        meta = probe_video(str(src))
-    except Exception:
-        meta = {}
-    q = nvenc_quality or _recommend_quality(meta)
+    # Fixed GOP from sample presets
+    gop = GOP_DEFAULT
 
     common_hls = [
         "-an",
         "-pix_fmt", "yuv420p",
-        "-g", str(q.gop),
-        "-keyint_min", str(q.gop),
+        "-g", str(gop),
+        "-keyint_min", str(gop),
         "-sc_threshold", "0",
         "-f", "hls",
         "-hls_time", str(segment_time),
@@ -246,38 +183,36 @@ def encode_to_hls(
     nvenc_cmd = [
         "ffmpeg", "-y", "-nostdin",
         "-i", str(src),
-        "-c:v", "h264_nvenc",
-        "-preset", q.preset,
-        "-rc", q.rc,
-        "-b:v", f"{q.target_kbps}k",
-        "-maxrate", f"{q.max_kbps}k",
-        "-bufsize", f"{q.buf_kbps}k",
-        "-profile:v", q.profile,
-        "-rc-lookahead", str(q.rc_lookahead),
-        "-spatial_aq", str(q.spatial_aq),
-        "-temporal_aq", str(q.temporal_aq),
-        "-aq-strength", str(q.aq_strength),
-        "-bf", str(q.b_frames),
+        "-c:v", "hevc_nvenc",
+        # Align with provided HEVC NVENC sample
+        "-preset", "p1",
+        "-rc", "vbr",
+        "-crf", "24",
+        "-rc-lookahead", "20",
+        "-spatial_aq", "1",
+        "-temporal_aq", "1",
+        "-aq-strength", "8",
+        "-bf", "0",
         "-tune", "hq",
     ] + common_hls
 
     proc = subprocess.run(nvenc_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if proc.returncode != 0:
-        # Fallback to libx264
+        # Fallback to libx265
         x264_cmd = [
             "ffmpeg", "-y", "-nostdin",
             "-i", str(src),
-            "-c:v", "libx264",
-            "-preset", "slow",
-            "-crf", "18",
-            "-bf", "3",
+            "-c:v", "libx265",
+            "-preset", "ultrafast",
+            "-crf", "24",
+            "-bf", "0",
         ] + common_hls
         proc2 = subprocess.run(x264_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         if proc2.returncode != 0:
             raise EncodeError(
-                "ffmpeg HLS failed with NVENC and libx264 fallback:\n"
+                "ffmpeg HLS failed with NVENC(hevc_nvenc) and libx265 fallback:\n"
                 + "--- NVENC stderr ---\n" + (proc.stderr or "")
-                + "\n--- libx264 stderr ---\n" + (proc2.stderr or "")
+                + "\n--- libx265 stderr ---\n" + (proc2.stderr or "")
             )
 
     # Collect outputs
@@ -354,13 +289,12 @@ def transcode_video(
     input_path: str,
     output_path: Optional[str] = None,
     *,
-    nvenc_quality: Optional[NvencQuality] = None,
-    x264_crf: int = 20,
+    x264_crf: int = 24,
 ) -> str:
     """
-    Re-encode a single video file to H.264 to reduce size.
+    Re-encode a single video file to HEVC to reduce size.
 
-    - Prefers NVENC (h264_nvenc) with recommended quality; falls back to libx264 CRF.
+    - Prefers NVENC (hevc_nvenc) with sample-like settings; falls back to libx265 CRF.
     - Returns absolute path to the output.
     """
     src = Path(input_path)
@@ -375,30 +309,24 @@ def transcode_video(
     if dst.parent:
         dst.parent.mkdir(parents=True, exist_ok=True)
 
-    # Pick quality params
-    try:
-        meta = probe_video(str(src))
-    except Exception:
-        meta = {}
-    q = nvenc_quality or _recommend_quality(meta)
+    # Fixed GOP from sample presets
+    gop = GOP_DEFAULT
 
     # NVENC attempt
     nvenc_cmd = [
         "ffmpeg", "-y", "-nostdin",
         "-i", str(src),
-        "-c:v", "h264_nvenc",
-        "-preset", q.preset,
-        "-rc", q.rc,
-        "-b:v", f"{q.target_kbps}k",
-        "-maxrate", f"{q.max_kbps}k",
-        "-bufsize", f"{q.buf_kbps}k",
-        "-profile:v", q.profile,
-        "-rc-lookahead", str(q.rc_lookahead),
-        "-spatial_aq", str(q.spatial_aq),
-        "-temporal_aq", str(q.temporal_aq),
-        "-aq-strength", str(q.aq_strength),
-        "-bf", str(q.b_frames),
-        "-g", str(q.gop),
+        "-c:v", "hevc_nvenc",
+        # Align with provided HEVC NVENC sample
+        "-preset", "p1",
+        "-rc", "vbr",
+        "-crf", "24",
+        "-rc-lookahead", "20",
+        "-spatial_aq", "1",
+        "-temporal_aq", "1",
+        "-aq-strength", "8",
+        "-bf", "0",
+        "-g", str(gop),
         "-tune", "hq",
         "-pix_fmt", "yuv420p",
         "-c:a", "aac",
@@ -407,15 +335,15 @@ def transcode_video(
     ]
     proc = subprocess.run(nvenc_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if proc.returncode != 0:
-        # libx264 fallback
+        # libx265 fallback
         x264_cmd = [
             "ffmpeg", "-y", "-nostdin",
             "-i", str(src),
-            "-c:v", "libx264",
-            "-preset", "slow",
+            "-c:v", "libx265",
+            "-preset", "ultrafast",
             "-crf", str(x264_crf),
-            "-bf", "3",
-            "-g", "240",
+            "-bf", "0",
+            "-g", str(gop),
             "-pix_fmt", "yuv420p",
             "-c:a", "aac",
             "-b:a", "128k",
@@ -424,9 +352,9 @@ def transcode_video(
         proc2 = subprocess.run(x264_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         if proc2.returncode != 0 or not dst.exists():
             raise EncodeError(
-                "ffmpeg transcode failed with NVENC and libx264 fallback:\n"
+                "ffmpeg transcode failed with NVENC(hevc_nvenc) and libx265 fallback:\n"
                 + "--- NVENC stderr ---\n" + (proc.stderr or "")
-                + "\n--- libx264 stderr ---\n" + (proc2.stderr or "")
+                + "\n--- libx265 stderr ---\n" + (proc2.stderr or "")
             )
 
     return str(dst.resolve())
