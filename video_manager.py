@@ -2,7 +2,7 @@ import time
 from pathlib import Path
 import shutil
 from typing import List
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
 
 from backend_module.database import DataBaseManager
 from backend_module.object_storage import MinioS3Uploader, S3Info
@@ -60,7 +60,7 @@ class TaskRunner:
         jobs = encode_job_query.get_queued_job(self.db_manager)
         hls_jobs = hls_job_query.get_queued_job(self.db_manager)
 
-        def _process_job(job: dict):
+        def _process_job(job: dict, *, backend: str = "auto"):
             job_id = job.get("id")
             file_id = job.get("file")
             if not job_id or not file_id:
@@ -89,7 +89,9 @@ class TaskRunner:
                     raise RuntimeError(f"Download failed: {dl_res.error}")
 
                 # エンコード（out/<uuid>/ に出力される）
-                outputs: List[str] = encode_to_segments(str(local_src), out_dir=str(work_dir / "encoded"))
+                outputs: List[str] = encode_to_segments(
+                    str(local_src), out_dir=str(work_dir / "encoded"), backend=backend
+                )
 
                 # アップロード（encoded/<file_id>/ 配下に格納）
                 upload_results = self.uploader.upload_files(outputs, key_prefix=f"encoded/{rid_leaf(file_id)}")
@@ -154,7 +156,7 @@ class TaskRunner:
                     pass
 
         # HLS ジョブ処理
-        def _process_hls_job(job: dict):
+        def _process_hls_job(job: dict, *, backend: str = "auto"):
             job_id = job.get("id")
             file_id = job.get("file")
             if not job_id or not file_id:
@@ -183,7 +185,9 @@ class TaskRunner:
                     raise RuntimeError(f"Download failed: {dl_res.error}")
 
                 # HLS エンコード（out/<uuid>/hls に出力される）
-                hls_out = encode_to_hls(str(local_src), out_dir=str(work_dir / "encoded"), segment_time=6)
+                hls_out = encode_to_hls(
+                    str(local_src), out_dir=str(work_dir / "encoded"), segment_time=6, backend=backend
+                )
                 playlist_path = hls_out["playlist"]
                 seg_paths: List[str] = list(hls_out["segments"])  # includes init + .m4s
                 out_root = Path(hls_out["out_dir"])
@@ -286,19 +290,64 @@ class TaskRunner:
                 except Exception:
                     pass
 
-        # まず HLS ジョブ
-        if hls_jobs:
-            with ThreadPoolExecutor(max_workers=2) as ex:
-                futures = [ex.submit(_process_hls_job, job) for job in hls_jobs]
-                for _ in as_completed(futures):
-                    pass
+        # 新スケジューラ: GPU/CPU 各1並列で実行（GPU優先）
+        pending: list[tuple[str, dict]] = []
+        # HLS を先に並べ、次に通常エンコード
+        for j in (hls_jobs or []):
+            pending.append(("hls", j))
+        for j in (jobs or []):
+            pending.append(("encode", j))
 
-        # 次に H264 MP4 セグメントジョブ
-        if jobs:
-            with ThreadPoolExecutor(max_workers=2) as ex:
-                futures = [ex.submit(_process_job, job) for job in jobs]
-                for _ in as_completed(futures):
-                    pass
+        if not pending:
+            return
+
+        gpu_ex = ThreadPoolExecutor(max_workers=1)
+        cpu_ex = ThreadPoolExecutor(max_workers=1)
+        try:
+            gpu_future = None
+            cpu_future = None
+
+            def _submit_next_to(resource: str):
+                nonlocal gpu_future, cpu_future
+                if not pending:
+                    return
+                kind, job = pending.pop(0)
+                if resource == "gpu":
+                    if kind == "hls":
+                        gpu_future = gpu_ex.submit(_process_hls_job, job, backend="gpu")
+                    else:
+                        gpu_future = gpu_ex.submit(_process_job, job, backend="gpu")
+                else:
+                    if kind == "hls":
+                        cpu_future = cpu_ex.submit(_process_hls_job, job, backend="cpu")
+                    else:
+                        cpu_future = cpu_ex.submit(_process_job, job, backend="cpu")
+
+            # まずGPUへ、次にCPUへ投げる
+            if gpu_future is None:
+                _submit_next_to("gpu")
+            if cpu_future is None:
+                _submit_next_to("cpu")
+
+            # 以降、どちらかが空いたら次を投入
+            while (gpu_future is not None or cpu_future is not None) or pending:
+                # 補充（先にGPU優先）
+                if gpu_future is None and pending:
+                    _submit_next_to("gpu")
+                if cpu_future is None and pending:
+                    _submit_next_to("cpu")
+
+                actives = [f for f in [gpu_future, cpu_future] if f is not None]
+                if not actives:
+                    break
+                done, _ = wait(actives, return_when=FIRST_COMPLETED)
+                if gpu_future in done:
+                    gpu_future = None
+                if cpu_future in done:
+                    cpu_future = None
+        finally:
+            gpu_ex.shutdown(wait=True)
+            cpu_ex.shutdown(wait=True)
 
     def _process_missing_thumbnails(self) -> bool:
         """Create and register thumbnails for videos missing thumbKey.
