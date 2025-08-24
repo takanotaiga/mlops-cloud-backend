@@ -11,3 +11,6 @@ datasets
 *.json
 *.parquet
 *.pyc
+*.mpg
+*.MOV
+*.avi
