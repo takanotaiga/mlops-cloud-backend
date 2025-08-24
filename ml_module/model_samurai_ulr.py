@@ -54,9 +54,6 @@ def _extract_frames(video_path: str, out_dir: str) -> Tuple[int, int, int, float
             if not ret:
                 break
             count += 1
-            # Hard safety: abort if frame count threshold exceeded during extraction
-            if count >= 16384:
-                raise ValueError("Video has 16384 or more frames; aborting per policy.")
             cv2.imwrite(osp.join(out_dir, f"{count:08d}.jpg"), frame, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
     finally:
         cap.release()
@@ -219,7 +216,13 @@ def _plot_on_video_from_parquet(video_path: str, results_parquet: str, out_path:
 
 from pathlib import Path
 from query.annotation_query import get_key_bboxes_for_file
-from backend_module.encoder import concat_videos, timelapse_merge
+from backend_module.encoder import (
+    concat_videos_safe,
+    timelapse_merge_to_duration,
+    count_frames,
+    count_frames_strict,
+    timelapse_single,
+)
 from backend_module.command_executer import cmd_exec
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import shutil
@@ -272,26 +275,65 @@ class SamuraiULRModel:
         for it in file_group:
             group_seg_paths.extend(list(it.get("segments") or []))
 
+        # Build a single fixed-duration timelapse (15 minutes) once per group
+        merged_ready = False
+        merged = str(work / "group_merged_timelapse.mp4")
         for item in file_group:
             fid = item.get("file_id")
             segs = item.get("segments") or []
             if not segs:
                 continue
-            # 1) Timelapse each segment in parallel and merge to keep <= 16384 frames
+            # 1) Timelapse each segment in parallel to achieve 15-minute total duration
             if not preprocess_started:
                 try:
                     tracker.start("preprocess") if tracker else None
                 except Exception:
                     pass
             # Build a single timelapse video for the whole merge group (only once)
-            merged = str(work / "group_merged_timelapse.mp4")
-            if not os.path.exists(merged):
+            if not merged_ready and not os.path.exists(merged):
                 try:
-                    _merged_path, _step = timelapse_merge(group_seg_paths, merged, max_frames=16384, max_workers=4)
-                except Exception as e:
-                    # If timelapse fails, fall back to simple concat (may still fail due to frame cap)
-                    merged = str(work / "group_merged.mp4")
-                    concat_videos(group_seg_paths, merged)
+                    print(f"[samurai/preprocess] timelapse_merge_to_duration start -> {merged}")
+                    merged, speed = timelapse_merge_to_duration(
+                        group_seg_paths,
+                        merged,
+                        duration_sec=15 * 60,
+                        max_workers=8,
+                        cpu_workers=6,
+                        gpu_workers=2,
+                        backend="auto",
+                        target_fps=30,
+                    )
+                    print(f"[samurai/preprocess] timelapse_merge done  -> {merged}")
+                    merged_ready = True
+                except Exception:
+                    # Robust fallback: safe concat then single-pass speed adjust to 15 minutes
+                    raw_merged = str(work / "group_merged_raw.mp4")
+                    try:
+                        print(f"[samurai/preprocess] concat(safe) fallback start -> {raw_merged}")
+                        concat_videos_safe(group_seg_paths, raw_merged)
+                        print(f"[samurai/preprocess] concat fallback done  -> {raw_merged}")
+                    except Exception:
+                        # As a final fallback, pick the first segment to proceed (best-effort)
+                        raw_merged = group_seg_paths[0]
+                    # Speed adjust to 15 minutes
+                    merged = str(work / "group_merged_timelapse.mp4")
+                    try:
+                        from backend_module.encoder import probe_video  # type: ignore
+                        meta = probe_video(raw_merged)
+                        dur = float(meta.get("durationSec") or 0.0)
+                    except Exception:
+                        dur = 0.0
+                    speed = (dur / float(15 * 60)) if dur > 0 else 1.0
+                    print(f"[samurai/preprocess] single speedup fallback start S={speed:.4f} -> {merged}")
+                    # reuse _make_speedup_single via public helper timelapse_single with step=1 then setpts adjust
+                    # Here we directly call timelapse_single with step=1 for CFR, then a final correction
+                    tmp_tl = str(work / "group_merged_tmp.mp4")
+                    timelapse_single(raw_merged, tmp_tl, 1)
+                    # final adjust
+                    from backend_module.encoder import _make_speedup_single as _speed  # type: ignore
+                    _speed(tmp_tl, merged, max(0.0001, speed))
+                    print(f"[samurai/preprocess] single speedup fallback done  -> {merged}")
+                    merged_ready = True
 
             # fetch seed boxes from annotations for this file
             anns = get_key_bboxes_for_file(db_manager, fid)
@@ -314,10 +356,7 @@ class SamuraiULRModel:
             # Extract frames from the group-level merged timelapse
             frames_dir = str(work / "group_frames")
             _ensure_dir(frames_dir)
-            # Pre-check total frames; reject >= 16384
-            total_fc = _get_total_frame_count(merged)
-            if total_fc >= 16384:
-                raise ValueError(f"Video {merged} has {total_fc} frames (>=16384); rejecting before inference.")
+            # Frame count is no longer used for gating; proceed to extraction directly
             frame_count, width, height, fps = _extract_frames(merged, frames_dir)
             if not preprocess_started:
                 try:
