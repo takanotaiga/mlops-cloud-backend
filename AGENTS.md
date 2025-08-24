@@ -64,8 +64,8 @@
 
 ### Encoding Layer
 - `backend_module/encoder.py`:
-  - `encode_to_segments(input_path, out_dir=None, nvenc_quality=None)`: splits video into ~180-second segments.
-    - Prefers NVIDIA NVENC (`h264_nvenc`) with quality settings estimated from input metadata; falls back to `libx264` if NVENC fails, raising `EncodeError` only if both fail.
+  - `encode_to_segments(input_path, out_dir=None)`: splits video into ~180-second segments.
+    - Uses NVIDIA NVENC HEVC (`hevc_nvenc`) with sample-aligned flags; falls back to `libx265` if NVENC fails, raising `EncodeError` only if both fail.
     - Outputs files under `<out_dir or input_dir/out>/<uuid>/out_###.mp4` and returns absolute paths.
   - `probe_video(path)`: `ffprobe` wrapper to extract duration, width/height, frame rate, and codec.
   - `encode_to_segments_links(...)`: convenience returning `file://` links for local consumption.
