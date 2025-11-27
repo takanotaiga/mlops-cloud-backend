@@ -288,8 +288,7 @@ class SamuraiULRModel:
                     merged, speed = timelapse_merge_to_duration(
                         group_seg_paths,
                         merged,
-                        duration_sec=15 * 60,
-                        max_workers=8,
+                        target_frames=15 * 60 * 30,
                         cpu_workers=6,
                         gpu_workers=2,
                         backend="auto",

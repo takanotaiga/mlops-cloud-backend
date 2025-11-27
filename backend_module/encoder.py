@@ -1014,22 +1014,42 @@ def timelapse_merge_to_duration(
     segments: List[str],
     merged_out: str,
     *,
-    duration_sec: int = 900,
-    max_workers: int = 4,
+    target_frames: int = 27000,
     backend: Literal["auto", "gpu", "cpu"] = "auto",
     cpu_workers: int = 6,
     gpu_workers: int = 2,
     target_fps: int = 30,
 ) -> Tuple[str, float]:
     """
-    Create a timelapse whose total duration matches duration_sec exactly (± a few ms).
+    Create a timelapse whose total frames match `target_frames` at `target_fps` (± a small tolerance).
 
-    - Computes total input duration, derives a common speed factor S = total/duration.
+    - Computes total input duration, derives a common speed factor S = total_dur / target_duration
+      where target_duration = target_frames / target_fps (but will not slow down clips when the
+      source has fewer frames than requested).
     - Per-segment time-scale with CFR re-encode, then safe-concat with re-encode.
     - Returns: (merged_path, speed_factor)
     """
     if not segments:
         raise ValueError("No segments provided for timelapse_merge_to_duration")
+
+    target_frames = max(1, int(target_frames))
+    target_fps = max(1, int(target_fps))
+
+    target_duration_sec = target_frames / float(target_fps)
+
+    # Estimate total frames to decide whether to stretch; prefer frame count over duration
+    est_total_frames = 0
+    frames_unknown = False
+    for s in segments:
+        try:
+            n = count_frames(s)
+            if n is None:
+                frames_unknown = True
+                break
+            est_total_frames += n
+        except Exception:
+            frames_unknown = True
+            break
 
     # Sum durations
     total_dur = 0.0
@@ -1041,9 +1061,17 @@ def timelapse_merge_to_duration(
         except Exception:
             pass
     if total_dur <= 0.0:
-        # Fallback: assume 30min to avoid divide by zero; S=2 for 15min target
+        # Fallback: assume 30min to avoid divide by zero
         total_dur = 1800.0
-    S = max(0.0001, total_dur / float(duration_sec))
+
+    # Avoid stretching when total frames (or duration) are already below the target
+    shorter_than_target = False
+    if not frames_unknown and est_total_frames > 0 and est_total_frames < target_frames:
+        shorter_than_target = True
+    elif frames_unknown and total_dur < target_duration_sec:
+        shorter_than_target = True
+
+    S = 1.0 if shorter_than_target else max(0.0001, total_dur / float(target_duration_sec))
 
     tmp_dir = Path(Path(merged_out).parent or ".") / f"tl_{get_uuid(8)}"
     tmp_dir.mkdir(parents=True, exist_ok=True)
@@ -1087,18 +1115,32 @@ def timelapse_merge_to_duration(
     # Merge with safe re-encode
     merged_path = concat_videos_safe(out_paths, merged_out, backend=backend)
 
-    # Final duration correction to be exactly duration_sec (when small drift exists)
-    try:
-        meta = probe_video(merged_path)
-        dur = float(meta.get("durationSec") or 0.0)
-    except Exception:
-        dur = 0.0
-    if dur > 0.0 and abs(dur - float(duration_sec)) > 0.05:  # >50ms drift
-        corr = max(0.0001, dur / float(duration_sec))
-        corrected = str(Path(merged_out).with_suffix("").with_name(Path(merged_out).stem + "_corr.mp4"))
-        _make_speedup_single(merged_path, corrected, corr, backend=backend, target_fps=target_fps)
-        Path(merged_path).unlink(missing_ok=True)
-        Path(corrected).rename(merged_path)
+    # Final frame-count correction to be close to target_frames
+    actual_frames = count_frames(merged_path)
+    if actual_frames is not None:
+        tol_frames = max(3, int(target_frames * 0.01))  # allow small drift (>=3 frames or 1%)
+        # Only tighten when we exceed the requested frames; do not stretch shorter clips
+        if actual_frames > target_frames + tol_frames:
+            corr = max(0.0001, actual_frames / float(target_frames))
+            corrected = str(Path(merged_out).with_suffix("").with_name(Path(merged_out).stem + "_corr.mp4"))
+            _make_speedup_single(merged_path, corrected, corr, backend=backend, target_fps=target_fps)
+            Path(merged_path).unlink(missing_ok=True)
+            Path(corrected).rename(merged_path)
+            S *= corr
+    else:
+        # Fallback to duration-based correction when frame count is unavailable
+        try:
+            meta = probe_video(merged_path)
+            dur = float(meta.get("durationSec") or 0.0)
+        except Exception:
+            dur = 0.0
+        if dur > target_duration_sec and abs(dur - float(target_duration_sec)) > 0.05:
+            corr = max(0.0001, dur / float(target_duration_sec))
+            corrected = str(Path(merged_out).with_suffix("").with_name(Path(merged_out).stem + "_corr.mp4"))
+            _make_speedup_single(merged_path, corrected, corr, backend=backend, target_fps=target_fps)
+            Path(merged_path).unlink(missing_ok=True)
+            Path(corrected).rename(merged_path)
+            S *= corr
 
     # Cleanup temp parts
     try:
