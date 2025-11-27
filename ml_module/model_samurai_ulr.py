@@ -232,6 +232,29 @@ class SamuraiULRModel:
         except Exception:
             tracker = None
 
+        failed_steps: set[str] = set()
+
+        def start_step(step_key: str) -> None:
+            try:
+                tracker.start(step_key) if tracker else None
+            except Exception:
+                pass
+
+        def complete_step(step_key: str) -> None:
+            if step_key in failed_steps:
+                return
+            try:
+                tracker.complete(step_key) if tracker else None
+            except Exception:
+                pass
+
+        def fail_step(step_key: str) -> None:
+            failed_steps.add(step_key)
+            try:
+                tracker.fail(step_key) if tracker else None
+            except Exception:
+                pass
+
         # Preprocess step begins at the first file
         preprocess_started = False
 
@@ -257,10 +280,7 @@ class SamuraiULRModel:
                 continue
             # 1) Timelapse each segment in parallel to achieve 15-minute total duration
             if not preprocess_started:
-                try:
-                    tracker.start("preprocess") if tracker else None
-                except Exception:
-                    pass
+                start_step("preprocess")
             # Build a single timelapse video for the whole merge group (only once)
             if not merged_ready and not os.path.exists(merged):
                 try:
@@ -331,22 +351,17 @@ class SamuraiULRModel:
             # Frame count is no longer used for gating; proceed to extraction directly
             frame_count, width, height, fps = _extract_frames(merged, frames_dir)
             if not preprocess_started:
-                try:
-                    tracker.complete("preprocess") if tracker else None
-                except Exception:
-                    pass
+                complete_step("preprocess")
                 preprocess_started = True
 
             # Start SAM2 immediately after preprocess for clarity in UI
-            try:
-                tracker.start("sam2") if tracker else None
-            except Exception:
-                pass
+            start_step("sam2")
 
             # Run predict strictly one key per call using CLI and collect results
             # Then merge per-seed parquet files into a single parquet for this file
             import pandas as pd  # local import to avoid global dependency timing
             per_seed_parquets: List[str] = []
+            sam2_failed = False
             for si, seed in enumerate(seeds):
                 # Convert normalized seeds to absolute pixel coords
                 x0 = max(0, min(width - 1, int(min(seed.x1, seed.x2) * width)))
@@ -355,16 +370,17 @@ class SamuraiULRModel:
                 y1 = max(0, min(height - 1, int(max(seed.y1, seed.y2) * height)))
 
                 out_json = work / f"group_seed{si:03d}_sam2.json"
-                cmd = [
+                rc = cmd_exec([
                     "python3", "-m", "ml_module.cli_infer_samrai",
                     "--images", str(frames_dir),
                     "--x0", str(x0), "--x1", str(x1),
                     "--y0", str(y0), "--y1", str(y1),
                     "--result", str(out_json),
-                ]
-                rc = cmd_exec(cmd)
+                ])
                 if rc != 0:
-                    continue
+                    sam2_failed = True
+                    fail_step("sam2")
+                    break
                 try:
                     import json
                     with open(out_json, "r", encoding="utf-8") as f:
@@ -374,6 +390,10 @@ class SamuraiULRModel:
                         per_seed_parquets.append(str(pq_path))
                 except Exception:
                     continue
+
+            if sam2_failed:
+                # Skip downstream steps for this file when SAM2 CLI fails
+                continue
 
             # Merge per-seed parquet files and add metadata columns for the whole group
             parquet_path = str(work / "group_results.parquet")
@@ -417,10 +437,7 @@ class SamuraiULRModel:
                     pass
 
             # Complete SAM2 right after result parquet is ready
-            try:
-                tracker.complete("sam2") if tracker else None
-            except Exception:
-                pass
+            complete_step("sam2")
 
             # Plotting for timelapse (kept for reference; not used as final output)
             tl_out_path = str(work / "group_tracked_timelapse.mp4")
@@ -457,10 +474,7 @@ class SamuraiULRModel:
             # 2) YOLO dataset export from SAM2 results (timelapse frames + parquet)
             try:
                 if not dataset_started:
-                    try:
-                        tracker.start("dataset_export") if tracker else None
-                    except Exception:
-                        pass
+                    start_step("dataset_export")
                 # Place dataset under /workspace/src/datasets per RT-DETR spec
                 datasets_base = Path("/workspace/src/datasets")
                 dataset_name = f"yolo_dataset_{Path(str(fid)).name}"
@@ -560,10 +574,7 @@ class SamuraiULRModel:
                         ])
                     )
                 if not dataset_started:
-                    try:
-                        tracker.complete("dataset_export") if tracker else None
-                    except Exception:
-                        pass
+                    complete_step("dataset_export")
                     dataset_started = True
             except Exception:
                 # Dataset export is best-effort; continue even if it fails
@@ -571,12 +582,9 @@ class SamuraiULRModel:
 
             # 3) Train RT-DETR via CLI and optionally export TensorRT
             if not train_started:
-                try:
-                    # Transition SAM2 -> RT-DETR train on first encounter
-                    tracker.complete("sam2") if tracker else None
-                    tracker.start("rtdetr_train") if tracker else None
-                except Exception:
-                    pass
+                # Transition SAM2 -> RT-DETR train on first encounter
+                complete_step("sam2")
+                start_step("rtdetr_train")
                 train_started = True
             train_out = Path(work) / f"train_result_{Path(str(fid)).name}"
             train_json = Path(work) / f"train_result_{Path(str(fid)).name}.json"
@@ -589,6 +597,8 @@ class SamuraiULRModel:
                 "--base-model", "rtdetr-l.pt",
                 "--result", str(train_json),
             ])
+            if rc != 0:
+                fail_step("rtdetr_train")
             if rc == 0 and train_json.exists():
                 import json
                 with open(train_json, "r", encoding="utf-8") as f:
@@ -599,19 +609,15 @@ class SamuraiULRModel:
 
             try:
                 model_engine = None
-                print("DEBUG: [model_pt]")
                 if model_pt:
                     # Check global cache to ensure we export TensorRT at most once per weights
                     with _TRT_EXPORT_LOCK:
                         cached = _TRT_EXPORT_CACHE.get(str(model_pt))
                     if cached is not None:
                         model_engine = cached
-                        try:
-                            # Even if cached, reflect that export is effectively complete
-                            tracker.start("trt_export") if tracker else None
-                            tracker.complete("trt_export") if tracker else None
-                        except Exception:
-                            pass
+                        # Even if cached, reflect that export is effectively complete
+                        start_step("trt_export")
+                        complete_step("trt_export")
                     else:
                         export_json = Path(work) / f"export_engine_{Path(str(fid)).name}.json"
                         # If an export JSON already exists (e.g., rerun), try to reuse it
@@ -622,19 +628,13 @@ class SamuraiULRModel:
                                 maybe_engine = exp_res.get("engine")
                                 if maybe_engine and os.path.exists(maybe_engine):
                                     model_engine = maybe_engine
-                                    try:
-                                        tracker.start("trt_export") if tracker else None
-                                        tracker.complete("trt_export") if tracker else None
-                                    except Exception:
-                                        pass
+                                    start_step("trt_export")
+                                    complete_step("trt_export")
                             except Exception:
                                 pass
                         # Perform export only if not already resolved
                         if not model_engine:
-                            try:
-                                tracker.start("trt_export") if tracker else None
-                            except Exception:
-                                pass
+                            start_step("trt_export")
                             rc2 = cmd_exec([
                                 "python3", "-m", "ml_module.cli_export_trt",
                                 "--weights", str(model_pt),
@@ -647,15 +647,9 @@ class SamuraiULRModel:
                                     model_engine = exp_res.get("engine")
                                 except Exception:
                                     model_engine = None
-                                try:
-                                    tracker.complete("trt_export") if tracker else None
-                                except Exception:
-                                    pass
+                                complete_step("trt_export")
                             else:
-                                try:
-                                    tracker.fail("trt_export") if tracker else None
-                                except Exception:
-                                    pass
+                                fail_step("trt_export")
                         # Update cache with result (including None to avoid repeated attempts)
                         with _TRT_EXPORT_LOCK:
                             _TRT_EXPORT_CACHE[str(model_pt)] = model_engine
@@ -675,14 +669,14 @@ class SamuraiULRModel:
         group_parquet: Optional[str] = None
         if global_model_path and group_seg_paths:
             if not infer_started:
-                try:
-                    tracker.complete("rtdetr_train") if (tracker and train_started) else None
-                    tracker.start("rtdetr_infer") if tracker else None
-                except Exception:
-                    pass
+                complete_step("rtdetr_train") if train_started else None
+                start_step("rtdetr_infer")
                 infer_started = True
 
+            infer_failed = False
+
             def _infer_one_group(seg_path: str, seg_index: int) -> Optional[Tuple[int, str]]:
+                nonlocal infer_failed
                 try:
                     out_parquet = str(work / f"group_seg{seg_index:03d}_infer.parquet")
                     out_video = str(work / f"group_seg{seg_index:03d}_infer.mp4")
@@ -696,9 +690,11 @@ class SamuraiULRModel:
                         "--result", out_json,
                     ])
                     if rc != 0:
+                        infer_failed = True
                         return None
                     return (seg_index, out_parquet) if os.path.exists(out_parquet) else None
                 except Exception:
+                    infer_failed = True
                     return None
 
             seg_results_all: Dict[int, str] = {}
@@ -710,15 +706,14 @@ class SamuraiULRModel:
                         si, p = r
                         if isinstance(si, int) and isinstance(p, str):
                             seg_results_all[si] = p
+            if infer_failed:
+                fail_step("rtdetr_infer")
 
             # Aggregate across all segments in the group
             aggregate_started = False
             try:
                 if not aggregate_started:
-                    try:
-                        tracker.start("aggregate") if tracker else None
-                    except Exception:
-                        pass
+                    start_step("aggregate")
                 seg_frame_counts: List[int] = []
                 for sp in group_seg_paths:
                     try:
@@ -768,10 +763,7 @@ class SamuraiULRModel:
                 pass
             finally:
                 if not aggregate_started:
-                    try:
-                        tracker.complete("aggregate") if tracker else None
-                    except Exception:
-                        pass
+                    complete_step("aggregate")
                     aggregate_started = True
 
         # If we could not produce a final group-level video, fallback to previous per-file outputs
@@ -788,19 +780,10 @@ class SamuraiULRModel:
         group_parquet = group_parquet_paths[0] if group_parquet_paths else None
 
         # Complete inference step for the group
-        try:
-            tracker.complete("rtdetr_infer") if (tracker and infer_started) else None
-        except Exception:
-            pass
-
-        # Complete inference step for the group
-        try:
-            tracker.complete("rtdetr_infer") if (tracker and infer_started) else None
-            # If training never started but SAM2 was started, close SAM2
-            if tracker and not train_started:
-                tracker.complete("sam2")
-        except Exception:
-            pass
+        complete_step("rtdetr_infer") if infer_started else None
+        # If training never started but SAM2 was started, close SAM2
+        if not train_started:
+            complete_step("sam2")
 
         return {
             "output_path": final_path,
