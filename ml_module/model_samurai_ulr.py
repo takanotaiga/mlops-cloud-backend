@@ -60,32 +60,6 @@ def _extract_frames(video_path: str, out_dir: str) -> Tuple[int, int, int, float
     return count, w, h, fps
 
 
-    
-
-
-def _results_schema_json() -> dict:
-    return {
-        "name": "samurai_ulr_inference",
-        "version": 1,
-        "description": "Per-frame object tracking results (bounding boxes)",
-        "fields": [
-            {"name": "file_id", "type": "string", "description": "SurrealDB file record id"},
-            {"name": "video_name", "type": "string", "description": "Original video logical name"},
-            {"name": "seed_index", "type": "int", "description": "Index of seed box for the object"},
-            {"name": "label", "type": "string", "description": "Label of the seed box"},
-            {"name": "frame_index", "type": "int", "description": "Zero-based frame index"},
-            {"name": "x", "type": "int", "description": "Top-left x"},
-            {"name": "y", "type": "int", "description": "Top-left y"},
-            {"name": "w", "type": "int", "description": "Width of bbox"},
-            {"name": "h", "type": "int", "description": "Height of bbox"},
-            {"name": "area", "type": "int", "description": "Mask area in pixels"}
-        ],
-    }
-
-
-    
-
-
 def _plot_from_parquet(frames_dir: str, results_parquet: str, *,
                        frame_count: int, width: int, height: int, fps: float, out_path: str) -> str:
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
@@ -219,8 +193,6 @@ from query.annotation_query import get_key_bboxes_for_file
 from backend_module.encoder import (
     concat_videos_safe,
     timelapse_merge_to_duration,
-    count_frames,
-    count_frames_strict,
     timelapse_single,
 )
 from backend_module.command_executer import cmd_exec
