@@ -165,14 +165,6 @@ def encode_to_segments(
     return outputs
 
 
-def encode_to_segments_links(input_path: str, out_dir: Optional[str] = None) -> List[str]:
-    """
-    エンコード済みファイルのリンク（file://）を返す。実体はローカルファイル。
-    """
-    paths = encode_to_segments(input_path, out_dir)
-    return [f"file://{p}" for p in paths]
-
-
 def encode_to_hls(
     input_path: str,
     out_dir: Optional[str] = None,

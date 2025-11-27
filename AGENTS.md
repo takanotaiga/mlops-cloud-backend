@@ -54,7 +54,6 @@
   - `MinioS3Uploader`: thin wrapper around `boto3.client('s3')` configured for MinIO-compatible endpoints.
   - Uploads: `upload_file()` and `upload_files()` with automatic multipart based on `TransferConfig` thresholds. Returns `UploadResult` with status in `S3Info`.
   - Downloads: `download_file()` and `download_files()`; pre-checks existence with `head_object`; supports keeping S3 key path structure. Returns `DownloadResult` with `S3Info`.
-  - Streaming: `stream_object(key)` yields chunks for large-object streaming use cases.
   - Content-Type inference via `mimetypes`; stable path-style addressing for MinIO.
 
 ### Database Layer
@@ -68,7 +67,6 @@
     - Uses NVIDIA NVENC HEVC (`hevc_nvenc`) with sample-aligned flags; falls back to `libx265` if NVENC fails, raising `EncodeError` only if both fail.
     - Outputs files under `<out_dir or input_dir/out>/<uuid>/out_###.mp4` and returns absolute paths.
   - `probe_video(path)`: `ffprobe` wrapper to extract duration, width/height, frame rate, and codec.
-  - `encode_to_segments_links(...)`: convenience returning `file://` links for local consumption.
 
 ### Query Helpers
 - `query/encode_job_query.py`:

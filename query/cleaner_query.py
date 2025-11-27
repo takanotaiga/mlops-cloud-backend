@@ -4,19 +4,6 @@ from backend_module.database import DataBaseManager
 from query.utils import extract_results
 
 
-def list_dead_file_keys(db_manager: DataBaseManager) -> List[str]:
-    """Return S3 keys from file rows marked as dead.
-
-    Runs: SELECT VALUE key FROM file WHERE dead = true;
-    """
-    payload = db_manager.query(
-        "SELECT VALUE key FROM file WHERE dead = true;"
-    )
-    results = extract_results(payload)
-    # Normalize to a clean list of non-empty strings
-    return [str(k) for k in results if isinstance(k, str) and k]
-
-
 def list_dead_file_records(db_manager: DataBaseManager) -> List[dict]:
     """Return [{ id, key, thumbKey? }] for file rows marked as dead."""
     payload = db_manager.query(
