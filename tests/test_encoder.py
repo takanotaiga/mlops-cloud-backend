@@ -28,6 +28,7 @@ def test_parse_fps() -> None:
     assert enc._parse_fps("bad") is None
 
 
+# ffprobeメタデータ取得と各種フレームカウント系ヘルパを実動画で確認
 def test_probe_video_and_frame_helpers(sample_video: Path) -> None:
     meta = enc.probe_video(str(sample_video))
     assert meta["width"] == 1280
@@ -49,6 +50,7 @@ def test_probe_video_and_frame_helpers(sample_video: Path) -> None:
     assert decoded is not None and decoded > 0
 
 
+# 実動画をCPUエンコードで分割できること
 def test_encode_to_segments_cpu(sample_video: Path, tmp_path: Path) -> None:
     outputs = enc.encode_to_segments(str(sample_video), out_dir=str(tmp_path / "segs"), backend="cpu")
     assert outputs
@@ -56,6 +58,7 @@ def test_encode_to_segments_cpu(sample_video: Path, tmp_path: Path) -> None:
         assert Path(out).exists()
 
 
+# autoでNVENC失敗時もフォールバックして分割できること
 def test_encode_to_segments_auto_fallback(sample_video: Path, tmp_path: Path) -> None:
     outputs = enc.encode_to_segments(str(sample_video), out_dir=str(tmp_path / "segs_auto"), backend="auto")
     assert outputs
@@ -63,6 +66,7 @@ def test_encode_to_segments_auto_fallback(sample_video: Path, tmp_path: Path) ->
         assert Path(out).exists()
 
 
+# 実動画をCPUでHLS(fMP4)出力できること
 def test_encode_to_hls_cpu(sample_video: Path, tmp_path: Path) -> None:
     result = enc.encode_to_hls(str(sample_video), out_dir=str(tmp_path / "hls"), backend="cpu", segment_time=6)
     assert Path(result["playlist"]).exists()
@@ -71,6 +75,7 @@ def test_encode_to_hls_cpu(sample_video: Path, tmp_path: Path) -> None:
         assert Path(s).exists()
 
 
+# トランスコードとサムネ生成が成功すること
 def test_transcode_video_and_thumbnail(sample_video: Path, tmp_path: Path) -> None:
     transcoded = enc.transcode_video(str(sample_video), output_path=str(tmp_path / "transcoded.mp4"))
     assert Path(transcoded).exists()
@@ -79,6 +84,7 @@ def test_transcode_video_and_thumbnail(sample_video: Path, tmp_path: Path) -> No
     assert Path(thumb).exists()
 
 
+# サムネ生成のエラーパスを検証
 def test_create_thumbnail_errors(sample_video: Path, tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError):
         enc.create_thumbnail("missing.mp4", str(tmp_path / "thumb.jpg"))
@@ -90,6 +96,7 @@ def test_create_thumbnail_errors(sample_video: Path, tmp_path: Path) -> None:
         enc.create_thumbnail(str(dummy), str(tmp_path / "thumb2.jpg"))
 
 
+# ロスレス結合と再エンコード結合が成功し、空入力はエラーとなること
 def test_concat_videos_and_safe(sample_video: Path, tmp_path: Path) -> None:
     copy1 = tmp_path / "c1.mp4"
     copy2 = tmp_path / "c2.mp4"
@@ -106,16 +113,19 @@ def test_concat_videos_and_safe(sample_video: Path, tmp_path: Path) -> None:
         enc.concat_videos([], str(tmp_path / "none.mp4"))
 
 
+# スピードアップ単体処理がCPUフォールバックで成功すること
 def test_make_speedup_single(sample_video: Path, tmp_path: Path) -> None:
     out = enc._make_speedup_single(str(sample_video), str(tmp_path / "speed.mp4"), speed=2.0, backend="cpu")
     assert Path(out).exists()
 
 
+# 単一動画のタイムラプス生成が成功すること
 def test_timelapse_single(sample_video: Path, tmp_path: Path) -> None:
     out = enc.timelapse_single(str(sample_video), str(tmp_path / "tl.mp4"), step=8, backend="cpu")
     assert Path(out).exists()
 
 
+# 複数セグメントをタイムラプス変換・結合しフレーム数上限を守ること
 def test_timelapse_merge(sample_video: Path, tmp_path: Path) -> None:
     seg1 = tmp_path / "seg1.mp4"
     seg2 = tmp_path / "seg2.mp4"
@@ -134,6 +144,7 @@ def test_timelapse_merge(sample_video: Path, tmp_path: Path) -> None:
     assert step >= 1
 
 
+# 目標フレーム数・FPSに合わせて時間圧縮結合できること
 def test_timelapse_merge_to_duration(sample_video: Path, tmp_path: Path) -> None:
     merged_out = tmp_path / "timelapse.mp4"
     target_frames = 60
@@ -157,6 +168,7 @@ def test_timelapse_merge_to_duration(sample_video: Path, tmp_path: Path) -> None
     assert frames == pytest.approx(target_frames, rel=0.2, abs=5)
 
 
+# 入力が空のときの例外や存在しない入力の例外を検証
 def test_timelapse_merge_to_duration_errors() -> None:
     with pytest.raises(ValueError):
         enc.timelapse_merge_to_duration([], "out.mp4")
