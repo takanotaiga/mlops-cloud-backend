@@ -1,5 +1,6 @@
 import os
 import time
+import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional, List
@@ -9,8 +10,15 @@ from backend_module.object_storage import MinioS3Uploader, S3Info
 from backend_module.config import load_surreal_config, load_s3_config
 from backend_module.uuid_tools import get_uuid
 from query import ml_inference_job_query
-from query.encoded_segment_query import get_segments_with_file_by_keys
-from query.utils import extract_results
+from query.ml_inference_job_query import (
+    get_nonvideo_file_keys,
+    get_encoded_video_keys,
+    get_hls_video_keys,
+)
+from query.encoded_segment_query import get_segments_with_file_by_keys as get_encoded_segments_by_keys
+from query.hls_segment_query import get_segments_with_file_by_keys as get_hls_segments_by_keys
+from query.hls_playlist_query import get_playlists_with_file_by_keys
+from query.utils import extract_results, rid_leaf
 from backend_module.progress_tracker import InferenceJobProgressTracker
  
 import mimetypes
@@ -70,6 +78,8 @@ class MLInferenceRunner:
         self,
         job_id: str,
         work_dir: Path,
+        *,
+        prefer_hls: bool = False,
     ) -> tuple[dict[str, list[dict]], dict[str, str], dict[str, str], list[list[list[object]]]]:
         """
         Download all files linked to the job's datasets and prepare
@@ -82,8 +92,14 @@ class MLInferenceRunner:
           - grouped: [[ [segment_path, seq], ... ], ...] group lists
         """
         print("==== Start Dataset Download ====")
-        linked_file = ml_inference_job_query.get_linked_file(self.db_manager, job_id)
-        download_result = self.uploader.download_files(keys=linked_file, dest_dir=work_dir)
+        nonvideo_keys = get_nonvideo_file_keys(self.db_manager, job_id)
+        video_keys = get_hls_video_keys(self.db_manager, job_id) if prefer_hls else get_encoded_video_keys(self.db_manager, job_id)
+        keys = (nonvideo_keys or []) + (video_keys or [])
+        download_result = self.uploader.download_files(
+            keys=keys,
+            dest_dir=work_dir,
+            keep_key_paths=prefer_hls,  # keep HLS directory structure for playlist references
+        )
         key_to_local = {
             r.key: r.local_path
             for r in download_result
@@ -92,42 +108,12 @@ class MLInferenceRunner:
         print("==== Complete ====")
 
         print("==== build groups ====")
-        def _is_video(path: str) -> bool:
-            mtype, _ = mimetypes.guess_type(path)
-            return (mtype or "").startswith("video/")
 
-        video_keys = [k for k, lp in key_to_local.items() if _is_video(lp)]
-        if not video_keys:
-            print("No video files in this batch; nothing to group.")
-            return {}, {}, {}, []
-
-        seg_payload = get_segments_with_file_by_keys(self.db_manager, video_keys)
-        seg_rows = extract_results(seg_payload)
-
-        print("[dataset_download]", "Aggregate segments by original file id")
+        # Containers shared by both HLS and encoded-segment paths
         file_segments: dict[str, list[dict]] = defaultdict(list)
         file_name_by_id: dict[str, str] = {}
         file_dataset_by_id: dict[str, str] = {}
-        for row in seg_rows:
-            key = row.get("key")
-            meta = row.get("meta") or {}
-            file_rid = str(row.get("file"))
-            file_name = row.get("file_name")
-            file_dataset = row.get("file_dataset")
-            if key not in key_to_local:
-                continue  # skip not downloaded
-            file_name_by_id[file_rid] = file_name
-            file_dataset_by_id[file_rid] = file_dataset
-            file_segments[file_rid].append(
-                {
-                    "key": key,
-                    "local_path": key_to_local[key],
-                    "index": (meta.get("index") if isinstance(meta, dict) else None),
-                }
-            )
 
-        # Sort segments within each file by numeric meta.index,
-        # with a robust fallback to the local filename pattern out_###.
         def _seg_sort_key(seg: dict):
             idx = seg.get("index")
             try:
@@ -142,6 +128,123 @@ class MLInferenceRunner:
             if m:
                 return (1, int(m.group(1)))
             return (2, base)
+
+        # --- HLS preferred path ---
+        if prefer_hls:
+            print("[dataset_download]", "HLS preferred: remuxing playlist to MP4")
+            hls_segment_keys = [k for k in key_to_local if k.endswith(".m4s") or k.endswith(".mp4")]
+            playlist_keys = [k for k in key_to_local if k.endswith(".m3u8")]
+
+            pl_rows = extract_results(get_playlists_with_file_by_keys(self.db_manager, playlist_keys)) if playlist_keys else []
+            seg_rows = extract_results(get_hls_segments_by_keys(self.db_manager, hls_segment_keys)) if hls_segment_keys else []
+
+            playlist_local_by_file: dict[str, str] = {}
+            for r in pl_rows:
+                fid = str(r.get("file"))
+                if not fid:
+                    continue
+                file_name_by_id[fid] = r.get("file_name")
+                file_dataset_by_id[fid] = r.get("file_dataset")
+                k = r.get("key")
+                lp = key_to_local.get(k)
+                if k and lp:
+                    playlist_local_by_file[fid] = lp
+
+            # Fill file metadata from segment rows if playlist rows are missing name/dataset
+            for r in seg_rows:
+                fid = str(r.get("file"))
+                if not fid:
+                    continue
+                file_name_by_id.setdefault(fid, r.get("file_name"))
+                file_dataset_by_id.setdefault(fid, r.get("file_dataset"))
+
+            def _remux_hls_to_mp4(playlist_path: str, out_path: str) -> bool:
+                out = Path(out_path)
+                out.parent.mkdir(parents=True, exist_ok=True)
+                cmd = [
+                    "ffmpeg",
+                    "-y",
+                    "-nostdin",
+                    "-protocol_whitelist",
+                    "file,crypto,data",
+                    "-i",
+                    playlist_path,
+                    "-c",
+                    "copy",
+                    "-movflags",
+                    "+faststart",
+                    "-bsf:a",
+                    "aac_adtstoasc",
+                    str(out),
+                ]
+                proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                if proc.returncode == 0 and out.exists():
+                    return True
+                # Retry without audio bitstream filter as a fallback
+                cmd2 = [
+                    "ffmpeg",
+                    "-y",
+                    "-nostdin",
+                    "-protocol_whitelist",
+                    "file,crypto,data",
+                    "-i",
+                    playlist_path,
+                    "-c",
+                    "copy",
+                    "-movflags",
+                    "+faststart",
+                    str(out),
+                ]
+                proc2 = subprocess.run(cmd2, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                return proc2.returncode == 0 and out.exists()
+
+            # Remux each playlist into a single MP4 per original file
+            for fid, pl_path in playlist_local_by_file.items():
+                safe_name = rid_leaf(str(fid))
+                out_mp4 = work_dir / f"{safe_name}_hls.mp4"
+                ok = _remux_hls_to_mp4(pl_path, str(out_mp4))
+                if not ok:
+                    continue
+                file_segments[fid].append({"key": pl_path, "local_path": str(out_mp4), "index": 1})
+
+            # If we could not build any videos from HLS, fall back to encoded segments
+            if not file_segments:
+                print("[dataset_download]", "HLS remux failed or missing; falling back to encoded segments.")
+                return self.dataset_download(job_id, work_dir, prefer_hls=False)
+
+        # --- Encoded segment path (default) ---
+        if not prefer_hls:
+            # Identify downloaded video files (mp4 segments)
+            def _is_video(path: str) -> bool:
+                mtype, _ = mimetypes.guess_type(path)
+                return (mtype or "").startswith("video/")
+
+            video_keys = [k for k, lp in key_to_local.items() if _is_video(lp)]
+            if not video_keys:
+                print("No video files in this batch; nothing to group.")
+                return {}, {}, {}, []
+
+            seg_payload = get_encoded_segments_by_keys(self.db_manager, video_keys)
+            seg_rows = extract_results(seg_payload)
+
+            print("[dataset_download]", "Aggregate segments by original file id")
+            for row in seg_rows:
+                key = row.get("key")
+                meta = row.get("meta") or {}
+                file_rid = str(row.get("file"))
+                file_name = row.get("file_name")
+                file_dataset = row.get("file_dataset")
+                if key not in key_to_local:
+                    continue  # skip not downloaded
+                file_name_by_id[file_rid] = file_name
+                file_dataset_by_id[file_rid] = file_dataset
+                file_segments[file_rid].append(
+                    {
+                        "key": key,
+                        "local_path": key_to_local[key],
+                        "index": (meta.get("index") if isinstance(meta, dict) else None),
+                    }
+                )
 
         for segs in file_segments.values():
             segs.sort(key=_seg_sort_key)
@@ -302,12 +405,14 @@ class MLInferenceRunner:
 
                 # Download dataset and build groups
                 tracker.start("download")
+                prefer_hls = bool(job_options.get("preferHls", True) if isinstance(job_options, dict) else True)
+                print(f"[inference_job] prefer_hls={prefer_hls}")
                 (
                     file_segments,
                     file_name_by_id,
                     file_dataset_by_id,
                     grouped,
-                ) = self.dataset_download(job_id=job_id, work_dir=work_dir)
+                ) = self.dataset_download(job_id=job_id, work_dir=work_dir, prefer_hls=prefer_hls)
                 tracker.complete("download")
                 if not grouped:
                     print("No valid groups produced for this job.")
