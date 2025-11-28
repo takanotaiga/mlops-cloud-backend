@@ -51,33 +51,27 @@ RUN apt update && apt -y install \
 RUN git clone --branch n12.2.72.0 --depth 1 https://git.videolan.org/git/ffmpeg/nv-codec-headers.git && \
     git clone -b n7.1 --depth=1 https://git.ffmpeg.org/ffmpeg.git && \
     git clone -b 4.9.0 --depth=1 https://github.com/opencv/opencv.git && \
-    git clone -b 4.9.0 --depth=1 https://github.com/opencv/opencv_contrib.git
-
-
-RUN cd nv-codec-headers && \
-    make install
-
-
-RUN  cd ffmpeg && \
-  ./configure \
-    --enable-shared \
-    --enable-gpl \
-    --enable-libx264 \
-    --enable-libx265 \
-    --enable-libaom \
-    --enable-nvdec \
-    --enable-nvenc \
-    --enable-nonfree && \
-  make -j20 && \
-  make install && \
-  echo "/usr/local/lib" > /etc/ld.so.conf.d/ffmpeg.conf && \
-  ldconfig
-
-
-RUN pip install -U pip && pip install numpy==1.26.4
-RUN cd opencv && \
+    git clone -b 4.9.0 --depth=1 https://github.com/opencv/opencv_contrib.git && \
+    cd /workspace/nv-codec-headers && \
+      make install && \
+    cd /workspace/ffmpeg && \
+      ./configure \
+        --enable-shared \
+        --enable-gpl \
+        --enable-libx264 \
+        --enable-libx265 \
+        --enable-libaom \
+        --enable-nvdec \
+        --enable-nvenc \
+        --enable-nonfree && \
+      make -j20 && \
+      make install && \
+      echo "/usr/local/lib" > /etc/ld.so.conf.d/ffmpeg.conf && \
+      ldconfig && \
+    pip install -U pip && pip install numpy==1.26.4 && \
+    cd /workspace/opencv && \
     mkdir build && \
-    cd build && \
+    cd /workspace/opencv/build && \
     cmake -D CMAKE_BUILD_TYPE=Release \
           -D OPENCV_EXTRA_MODULES_PATH=/workspace/opencv_contrib/modules \
           -D WITH_FFMPEG=ON \
@@ -105,12 +99,11 @@ RUN cd opencv && \
           .. && \
     make -j20 && \
     make install && \
-    ldconfig
-
-RUN rm -rf /workspace/*
-RUN apt-get autoremove -y \
- && apt-get clean \
- && rm -rf /var/lib/apt/lists/*
+    ldconfig && \
+    rm -rf /workspace/* && \
+    apt-get autoremove -y && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
 
 RUN python3 -m pip install -U pip && \
     python3 -m pip install -U \

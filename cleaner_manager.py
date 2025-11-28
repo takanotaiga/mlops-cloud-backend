@@ -2,15 +2,13 @@ import time
 from typing import List
 
 from backend_module.database import DataBaseManager
-from backend_module.object_storage import MinioS3Uploader, S3Info
+from backend_module.object_storage import MinioS3Uploader
 from backend_module.config import load_surreal_config, load_s3_config
 from query.cleaner_query import (
     list_dead_file_records,
     delete_file_record,
     list_orphan_annotations,
     delete_annotation_record,
-    list_orphan_encode_jobs,
-    delete_encode_job_record,
     list_orphan_encoded_segments,
     delete_encoded_segment_record,
     list_orphan_hls_jobs,
@@ -77,12 +75,6 @@ class TaskRunner:
             record_id = result["id"]
             self.s3.delete_key(s3_key)
             delete_annotation_record(self.db, record_id)
-            print(result)
-
-        reuslts = list_orphan_encode_jobs(self.db)
-        for result in reuslts:
-            record_id = result["id"]
-            delete_encode_job_record(self.db, record_id)
             print(result)
 
         reuslts = list_orphan_encoded_segments(self.db)

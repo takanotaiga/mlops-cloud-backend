@@ -54,9 +54,6 @@ def test_probe_video_and_frame_helpers(sample_video: Path) -> None:
 # 入力ファイルなしや不正入力で適切に例外が出ること
 def test_missing_inputs_errors(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError):
-        enc.encode_to_segments(str(tmp_path / "no.mp4"))
-
-    with pytest.raises(FileNotFoundError):
         enc.encode_to_hls(str(tmp_path / "no.mp4"))
 
     with pytest.raises(FileNotFoundError):
@@ -73,22 +70,6 @@ def test_missing_inputs_errors(tmp_path: Path) -> None:
 
     with pytest.raises(enc.EncodeError):
         enc.concat_videos_safe([str(tmp_path / "no.mp4")], str(tmp_path / "concat_safe.mp4"))
-
-
-# 実動画をCPUエンコードで分割できること
-def test_encode_to_segments_cpu(sample_video: Path, tmp_path: Path) -> None:
-    outputs = enc.encode_to_segments(str(sample_video), out_dir=str(tmp_path / "segs"), backend="cpu")
-    assert outputs
-    for out in outputs:
-        assert Path(out).exists()
-
-
-# autoでNVENC失敗時もフォールバックして分割できること
-def test_encode_to_segments_auto_fallback(sample_video: Path, tmp_path: Path) -> None:
-    outputs = enc.encode_to_segments(str(sample_video), out_dir=str(tmp_path / "segs_auto"), backend="auto")
-    assert outputs
-    for out in outputs:
-        assert Path(out).exists()
 
 
 # 実動画をCPUでHLS(fMP4)出力できること
@@ -234,6 +215,3 @@ def test_timelapse_merge_to_duration_no_stretch_when_shorter(sample_video: Path,
 def test_timelapse_merge_to_duration_errors() -> None:
     with pytest.raises(ValueError):
         enc.timelapse_merge_to_duration([], "out.mp4")
-
-    with pytest.raises(FileNotFoundError):
-        enc.encode_to_segments("missing.mp4")

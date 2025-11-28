@@ -47,27 +47,6 @@ def delete_annotation_record(db_manager: DataBaseManager, rid: str):
         {"ID": rid},
     )
 
-
-def list_orphan_encode_jobs(db_manager: DataBaseManager) -> List[dict]:
-    """Return [{ id }] for encode_job rows whose file.id is NONE."""
-    payload = db_manager.query(
-        "SELECT id FROM encode_job WHERE file.id = NONE;"
-    )
-    rows = extract_results(payload)
-    out: List[dict] = []
-    for r in rows:
-        if isinstance(r, dict) and r.get("id"):
-            out.append({"id": r.get("id")})
-    return out
-
-
-def delete_encode_job_record(db_manager: DataBaseManager, rid: str):
-    return db_manager.query(
-        "DELETE encode_job WHERE id = <record> $ID;",
-        {"ID": rid},
-    )
-
-
 def list_orphan_encoded_segments(db_manager: DataBaseManager) -> List[dict]:
     """Return [{ id, key }] for encoded_segment rows whose file.id is NONE."""
     payload = db_manager.query(
