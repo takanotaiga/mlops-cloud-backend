@@ -288,11 +288,11 @@ class SamuraiULRModel:
                     merged, speed = timelapse_merge_to_duration(
                         group_seg_paths,
                         merged,
-                        target_frames=15 * 60 * 30,
+                        target_frames=15 * 60 * 15,
                         cpu_workers=6,
                         gpu_workers=2,
                         backend="auto",
-                        target_fps=30,
+                        target_fps=15,
                     )
                     print(f"[samurai/preprocess] timelapse_merge done  -> {merged}")
                     merged_ready = True
