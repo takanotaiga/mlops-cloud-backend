@@ -1,0 +1,73 @@
+FROM ubuntu:jammy-20250530
+
+WORKDIR /workspace
+
+RUN ln -sf /usr/share/zoneinfo/Asia/Tokyo /etc/localtime
+RUN apt update && apt -y install \
+  autoconf \
+  automake \
+  build-essential \
+  git-core \
+  libfreetype6-dev \
+  libgnutls28-dev \
+  libmp3lame-dev \
+  libtool \
+  libunistring-dev \
+  libva-dev \
+  libvdpau-dev \
+  libvorbis-dev \
+  libx264-dev \
+  libx265-dev \
+  libxcb-shm0-dev \
+  libxcb-xfixes0-dev \
+  libxcb1-dev \
+  meson \
+  nasm \
+  ninja-build \
+  pkg-config \
+  texinfo \
+  wget \
+  yasm \
+  zlib1g-dev \
+  git \
+  curl
+
+RUN git clone -b n12.2.72.0 --depth 1 https://git.videolan.org/git/ffmpeg/nv-codec-headers.git && \
+    git clone -b n7.1 --depth=1 https://git.ffmpeg.org/ffmpeg.git && \
+    cd /workspace/nv-codec-headers && \
+    make install  && \
+    cd /workspace/ffmpeg && \
+    ./configure \
+      --enable-shared \
+      --enable-gpl \
+      --enable-libx264 \
+      --enable-libx265 \
+      --enable-nvdec \
+      --enable-nvenc \
+      --enable-nonfree && \
+    make -j20 && \
+    make install && \
+    echo "/usr/local/lib" > /etc/ld.so.conf.d/ffmpeg.conf && \
+    ldconfig && \
+    rm -rf /workspace/* && \
+    apt-get autoremove -y && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+
+WORKDIR /workspace/src
+
+COPY pyproject.toml /workspace/src
+COPY uv.lock /workspace/src
+RUN uv sync --extra=mlx
+
+RUN git clone -b master --single-branch --depth=1 https://github.com/moriyalab/samurai.git /workspace/samurai && \
+    cd /workspace/samurai/sam2/checkpoints && \
+    ./download_ckpts.sh && \
+    cd ..
+
+COPY ml_module /workspace/src/ml_module
+COPY backend_module /workspace/src/backend_module
+COPY query /workspace/src/query
+COPY *.py /workspace/src

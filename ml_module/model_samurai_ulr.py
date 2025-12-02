@@ -370,7 +370,7 @@ class SamuraiULRModel:
 
                 out_json = work / f"group_seed{si:03d}_sam2.json"
                 rc = cmd_exec([
-                    "python3", "-m", "ml_module.cli_infer_samrai",
+                    "uv", "run", "-m", "ml_module.cli_infer_samrai",
                     "--images", str(frames_dir),
                     "--x0", str(x0), "--x1", str(x1),
                     "--y0", str(y0), "--y1", str(y1),
@@ -588,7 +588,7 @@ class SamuraiULRModel:
             train_out = Path(work) / f"train_result_{Path(str(fid)).name}"
             train_json = Path(work) / f"train_result_{Path(str(fid)).name}.json"
             rc = cmd_exec([
-                "python3", "-m", "ml_module.cli_train_rtdetr",
+                "uv", "run", "-m", "ml_module.cli_train_rtdetr",
                 # Pass absolute path under /workspace/src/datasets
                 "--dataset", str(dataset_root),
                 "--out-dir", str(train_out),
@@ -635,7 +635,7 @@ class SamuraiULRModel:
                         if not model_engine:
                             start_step("trt_export")
                             rc2 = cmd_exec([
-                                "python3", "-m", "ml_module.cli_export_trt",
+                                "uv", "run", "-m", "ml_module.cli_export_trt",
                                 "--weights", str(model_pt),
                                 "--result", str(export_json),
                             ])
@@ -681,7 +681,7 @@ class SamuraiULRModel:
                     out_video = str(work / f"group_seg{seg_index:03d}_infer.mp4")
                     out_json = str(work / f"group_seg{seg_index:03d}_infer.json")
                     rc = cmd_exec([
-                        "python3", "-m", "ml_module.cli_infer_rtdetr",
+                        "uv", "run", "-m", "ml_module.cli_infer_rtdetr",
                         "--model", str(global_model_path),
                         "--video", str(seg_path),
                         "--out-parquet", out_parquet,

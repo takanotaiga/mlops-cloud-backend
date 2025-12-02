@@ -1,0 +1,43 @@
+[project]
+name = "mlops-cloud-backend"
+version = "1.6.0"
+description = "MLOps Cloud Backend"
+readme = "README.md"
+requires-python = ">=3.11, <3.12"
+dependencies = [
+    "surrealdb==1.0.4",
+    "boto3==1.38.44",
+    "uvicorn==0.34.3",
+    "python-multipart",
+    "paramiko==3.5.0",
+    "requests",
+    "pynvml",
+    "psutil"
+]
+
+[project.optional-dependencies]
+mlx = [
+    "torch==2.8.0+cu128",
+    "torchvision",
+    "torchaudio",
+    "ultralytics==8.3.232",
+    "onnx>=1.12.0,<=1.19.1",
+    "onnxslim>=0.1.71",
+    "onnxruntime-gpu==1.23.2",
+    "tensorrt-cu12",
+    "pandas",
+    "opencv-python",
+    "hydra-core",
+    "tqdm",
+    "loguru",
+    "iopath",
+    "pyarrow",
+]
+
+[tool.uv]
+extra-index-url = [
+  "https://pypi.ngc.nvidia.com",
+  "https://download.pytorch.org/whl/cu128",
+]
+find-links = ["https://nvidia-kaolin.s3.us-east-2.amazonaws.com/torch-2.8.0_cu128.html"]
+index-strategy = "unsafe-best-match"

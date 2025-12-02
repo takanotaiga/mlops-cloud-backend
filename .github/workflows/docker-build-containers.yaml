@@ -23,24 +23,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: cv
-            file: Dockerfile.cv
-            image_suffix: -cv
-          - name: hm
-            file: Dockerfile.hm
-            image_suffix: -hm
-          - name: sm
-            file: Dockerfile.sm
-            image_suffix: -sm
-          - name: cm
-            file: Dockerfile.cm
-            image_suffix: -cm
-          - name: tm
-            file: Dockerfile.tm
-            image_suffix: -tm
-          - name: mlx
-            file: Dockerfile.mlx
-            image_suffix: -mlx
+          - name: base
+            file: Dockerfile.base
+            image_suffix: -base
+          - name: gpu
+            file: Dockerfile.gpu
+            image_suffix: -gpu
     permissions:
       contents: read
       packages: write
