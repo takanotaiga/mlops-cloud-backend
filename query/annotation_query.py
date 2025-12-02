@@ -17,17 +17,3 @@ def get_key_bboxes_for_file(db_manager: DataBaseManager, file_id: str, *, catego
         {"CAT": category, "FILE": file_id},
     )
     return extract_results(payload)
-
-
-def get_key_bboxes_for_files(db_manager: DataBaseManager, file_ids: List[str], *, category: str = "sam2_key_bbox") -> List[dict]:
-    """Return annotations for multiple files."""
-    payload = db_manager.query(
-        """
-        SELECT * FROM annotation
-        WHERE category = $CAT AND file INSIDE $FILES
-        ORDER BY file ASC, id ASC;
-        """,
-        {"CAT": category, "FILES": [f"file:{fid}" if not str(fid).startswith("file:") else fid for fid in file_ids]},
-    )
-    return extract_results(payload)
-

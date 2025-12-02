@@ -3,12 +3,25 @@ import tempfile
 import json
 from pathlib import Path
 from typing import List, Optional, Tuple, Dict, Literal
-from backend_module.uuid_tools import get_uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+from backend_module.command_executer import cmd_exec
+from backend_module.uuid_tools import get_uuid
 
 
 class EncodeError(Exception):
     """Raised when ffmpeg encoding fails."""
+
+
+def _run_with_executor(cmd: List[str]) -> Tuple[int, str]:
+    """Run command via shared executor, capturing combined output."""
+    res = cmd_exec(cmd, capture_output=True)
+    if isinstance(res, tuple) and len(res) == 2:
+        rc, out = res
+    else:
+        rc = res if isinstance(res, int) else -1
+        out = ""
+    return int(rc) if rc is not None else -1, out or ""
 
 
 def _parse_fps(s: Optional[str]) -> Optional[float]:
@@ -24,153 +37,6 @@ def _parse_fps(s: Optional[str]) -> Optional[float]:
 
 
 GOP_DEFAULT = 240
-
-
-def encode_to_segments(
-    input_path: str,
-    out_dir: Optional[str] = None,
-    *,
-    backend: Literal["auto", "gpu", "cpu"] = "auto",
-) -> List[str]:
-    """
-    指定された動画ファイルをffmpegで分割エンコードし、生成されたファイルの絶対パスを返す。
-
-    実行コマンド（NVENC使用, HEVC）例:
-    ffmpeg -y -nostdin -i INPUT -an -c:v hevc_nvenc -preset p1 -rc vbr -crf 24 \
-        -rc-lookahead 20 -spatial_aq 1 -temporal_aq 1 -aq-strength 8 -bf 0 -g 240 -tune hq -pix_fmt yuv420p \
-        -f segment -segment_time 180 -reset_timestamps 1 OUT_DIR/out_%03d.mp4
-
-    例外は呼び出し側のtry/exceptで扱う想定。
-    """
-    src = Path(input_path)
-    if not src.exists():
-        raise FileNotFoundError(f"Input not found: {src}")
-
-    # 出力ディレクトリは実行ごとに UUID サブディレクトリで分離
-    # デフォルト: 入力と同階層に out/<uuid>/
-    run_id = get_uuid(16)
-    base_out = Path(out_dir) if out_dir else (src.parent / "out")
-    out_dir_path = base_out / run_id
-    out_dir_path.mkdir(parents=True, exist_ok=True)
-
-    # 出力テンプレート
-    out_tpl = str(out_dir_path / "out_%03d.mp4")
-
-    # まず NVENC(HEVC) で試行。失敗したら libx265 にフォールバック（auto時）。
-    nvenc_cmd = [
-        "ffmpeg",
-        "-y",
-        "-nostdin",
-        "-i",
-        str(src),
-        "-an",
-        "-c:v",
-        "hevc_nvenc",
-        # サンプルに合わせた HEVC NVENC プリセット
-        "-preset", "p1",
-        "-rc", "vbr",
-        "-crf", "24",
-        "-rc-lookahead", "20",
-        "-spatial_aq", "1",
-        "-temporal_aq", "1",
-        "-aq-strength", "8",
-        "-bf", "0",
-        "-g", "240",
-        "-tune", "hq",
-        "-pix_fmt", "yuv420p",
-        "-f",
-        "segment",
-        "-segment_time",
-        "180",
-        "-reset_timestamps",
-        "1",
-        out_tpl,
-    ]
-
-    def _run(cmd: List[str]) -> subprocess.CompletedProcess:
-        return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-
-    if backend == "gpu":
-        proc = _run(nvenc_cmd)
-        if proc.returncode != 0:
-            raise EncodeError(
-                "ffmpeg failed on GPU NVENC (forced)\n" + (proc.stderr or "")
-            )
-    elif backend == "cpu":
-        x264_cmd = [
-            "ffmpeg",
-            "-y",
-            "-nostdin",
-            "-i",
-            str(src),
-            "-an",
-            "-c:v",
-            "libx265",
-            "-preset", "ultrafast",
-            "-crf", "24",
-            "-bf", "0",
-            "-g", "240",
-            "-pix_fmt", "yuv420p",
-            "-f",
-            "segment",
-            "-segment_time",
-            "180",
-            "-reset_timestamps",
-            "1",
-            out_tpl,
-        ]
-        proc2 = _run(x264_cmd)
-        if proc2.returncode != 0:
-            raise EncodeError("ffmpeg failed on CPU libx265 (forced)\n" + (proc2.stderr or ""))
-    else:
-        proc = _run(nvenc_cmd)
-        if proc.returncode != 0:
-            # NVENC が使えない場合（10bitやGPU非搭載）はCPUエンコード(HEVC)へ切替
-            print("CHANGED CPU ENCODE MODE")
-            x264_cmd = [
-                "ffmpeg",
-                "-y",
-                "-nostdin",
-                "-i",
-                str(src),
-                "-an",
-                "-c:v",
-                "libx265",
-                "-preset", "ultrafast",
-                "-crf", "24",
-                "-bf", "0",
-                "-g", "240",
-                "-pix_fmt", "yuv420p",
-                "-f",
-                "segment",
-                "-segment_time",
-                "180",
-                "-reset_timestamps",
-                "1",
-                out_tpl,
-            ]
-            proc2 = _run(x264_cmd)
-            if proc2.returncode != 0:
-                # 両方失敗した場合のみ失敗を返す（NVENC のログを含める）
-                raise EncodeError(
-                    "ffmpeg failed with NVENC(hevc_nvenc) and libx265 fallback:\n"
-                    + "--- NVENC stderr ---\n" + (proc.stderr or "")
-                    + "\n--- libx265 stderr ---\n" + (proc2.stderr or "")
-                )
-
-    # 生成ファイルを列挙
-    outputs = sorted(str(p.resolve()) for p in out_dir_path.glob("out_*.mp4"))
-    if not outputs:
-        raise EncodeError("ffmpeg completed but no output segments were found")
-    return outputs
-
-
-def encode_to_segments_links(input_path: str, out_dir: Optional[str] = None) -> List[str]:
-    """
-    エンコード済みファイルのリンク（file://）を返す。実体はローカルファイル。
-    """
-    paths = encode_to_segments(input_path, out_dir)
-    return [f"file://{p}" for p in paths]
 
 
 def encode_to_hls(
@@ -238,13 +104,10 @@ def encode_to_hls(
         "-tune", "hq",
     ] + common_hls
 
-    def _run(cmd: List[str]) -> subprocess.CompletedProcess:
-        return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-
     if backend == "gpu":
-        proc = _run(nvenc_cmd)
-        if proc.returncode != 0:
-            raise EncodeError("ffmpeg HLS failed on GPU NVENC (forced)\n" + (proc.stderr or ""))
+        rc, out = _run_with_executor(nvenc_cmd)
+        if rc != 0:
+            raise EncodeError("ffmpeg HLS failed on GPU NVENC (forced)\n" + (out or ""))
     elif backend == "cpu":
         x264_cmd = [
             "ffmpeg", "-y", "-nostdin",
@@ -254,12 +117,12 @@ def encode_to_hls(
             "-crf", "24",
             "-bf", "0",
         ] + common_hls
-        proc2 = _run(x264_cmd)
-        if proc2.returncode != 0:
-            raise EncodeError("ffmpeg HLS failed on CPU libx265 (forced)\n" + (proc2.stderr or ""))
+        rc2, out2 = _run_with_executor(x264_cmd)
+        if rc2 != 0:
+            raise EncodeError("ffmpeg HLS failed on CPU libx265 (forced)\n" + (out2 or ""))
     else:
-        proc = _run(nvenc_cmd)
-        if proc.returncode != 0:
+        rc, out = _run_with_executor(nvenc_cmd)
+        if rc != 0:
             # Fallback to libx265
             x264_cmd = [
                 "ffmpeg", "-y", "-nostdin",
@@ -269,12 +132,12 @@ def encode_to_hls(
                 "-crf", "24",
                 "-bf", "0",
             ] + common_hls
-            proc2 = _run(x264_cmd)
-            if proc2.returncode != 0:
+            rc2, out2 = _run_with_executor(x264_cmd)
+            if rc2 != 0:
                 raise EncodeError(
                     "ffmpeg HLS failed with NVENC(hevc_nvenc) and libx265 fallback:\n"
-                    + "--- NVENC stderr ---\n" + (proc.stderr or "")
-                    + "\n--- libx265 stderr ---\n" + (proc2.stderr or "")
+                    + "--- NVENC stderr ---\n" + (out or "")
+                    + "\n--- libx265 stderr ---\n" + (out2 or "")
                 )
 
     # Collect outputs
@@ -395,8 +258,8 @@ def transcode_video(
         "-b:a", "128k",
         str(dst),
     ]
-    proc = subprocess.run(nvenc_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    if proc.returncode != 0:
+    rc, out = _run_with_executor(nvenc_cmd)
+    if rc != 0:
         # libx265 fallback
         x264_cmd = [
             "ffmpeg", "-y", "-nostdin",
@@ -411,12 +274,12 @@ def transcode_video(
             "-b:a", "128k",
             str(dst),
         ]
-        proc2 = subprocess.run(x264_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        if proc2.returncode != 0 or not dst.exists():
+        rc2, out2 = _run_with_executor(x264_cmd)
+        if rc2 != 0 or not dst.exists():
             raise EncodeError(
                 "ffmpeg transcode failed with NVENC(hevc_nvenc) and libx265 fallback:\n"
-                + "--- NVENC stderr ---\n" + (proc.stderr or "")
-                + "\n--- libx265 stderr ---\n" + (proc2.stderr or "")
+                + "--- NVENC stderr ---\n" + (out or "")
+                + "\n--- libx265 stderr ---\n" + (out2 or "")
             )
 
     return str(dst.resolve())
@@ -463,11 +326,11 @@ def create_thumbnail(
         str(quality),
         str(dst),
     ]
-    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    if proc.returncode != 0 or not dst.exists():
+    rc, out = _run_with_executor(cmd)
+    if rc != 0 or not dst.exists():
         raise EncodeError(
             "ffmpeg thumbnail generation failed\n"
-            + (proc.stderr[-200:] if proc.stderr else "")
+            + ((out or "")[-200:] if out else "")
         )
     return str(dst.resolve())
 
@@ -499,10 +362,10 @@ def concat_videos(inputs: List[str], output_path: str) -> str:
         "-c", "copy",
         str(out),
     ]
-    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    if proc.returncode != 0 or not out.exists():
+    rc, out_log = _run_with_executor(cmd)
+    if rc != 0 or not out.exists():
         raise EncodeError(
-            "ffmpeg concat failed\n" + (proc.stderr[-300:] if proc.stderr else "")
+            "ffmpeg concat failed\n" + ((out_log or "")[-300:] if out_log else "")
         )
     return str(out.resolve())
 
@@ -573,17 +436,17 @@ def concat_videos_safe(inputs: List[str], output_path: str, *, backend: Literal[
         "-c:v", "libx265", "-preset", "ultrafast", "-crf", "24",
         str(out),
     ]
-    p = subprocess.run(hevc_nv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    if p.returncode != 0:
-        p2 = subprocess.run(h264_nv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        if p2.returncode != 0:
-            p3 = subprocess.run(nv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            if p3.returncode != 0:
-                p4 = subprocess.run(x, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-                if p4.returncode != 0 or not out.exists():
-                    raise EncodeError(
-                        "ffmpeg concat(re-encode) failed across NVDec(hevc/h264) and NVEnc, CPU fallback also failed\n"
-                    )
+    rc, log = _run_with_executor(hevc_nv)
+    if rc != 0:
+        rc2, log2 = _run_with_executor(h264_nv)
+        if rc2 != 0:
+            rc3, log3 = _run_with_executor(nv)
+            if rc3 != 0:
+                rc4, log4 = _run_with_executor(x)
+                if rc4 != 0 or not out.exists():
+                    msg = "ffmpeg concat(re-encode) failed across NVDec(hevc/h264) and NVEnc, CPU fallback also failed\n"
+                    detail = log4 or log3 or log2 or log
+                    raise EncodeError(msg + (detail or ""))
     return str(out.resolve())
 
 
@@ -755,34 +618,30 @@ def _make_timelapse_single(
         "-pix_fmt", "yuv420p",
         str(out),
     ]
-
-    def _run(cmd: List[str]) -> subprocess.CompletedProcess:
-        return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-
     def _try_chain() -> None:
         # Try NVDec HEVC
-        p = _run(hevc_cuvid)
-        if p.returncode == 0:
+        rc, log = _run_with_executor(hevc_cuvid)
+        if rc == 0:
             return
         # Try NVDec H264
-        p2 = _run(h264_cuvid)
-        if p2.returncode == 0:
+        rc2, log2 = _run_with_executor(h264_cuvid)
+        if rc2 == 0:
             return
         # Try normal decode -> NVEnc
-        p3 = _run(nvenc_cmd)
-        if p3.returncode == 0:
+        rc3, log3 = _run_with_executor(nvenc_cmd)
+        if rc3 == 0:
             return
         # CPU fallback
-        p4 = _run(x265_cmd)
-        if p4.returncode != 0:
-            raise EncodeError(
-                "ffmpeg timelapse failed across all decode paths (hevc_cuvid, h264_cuvid, normal) and CPU fallback\n"
-            )
+        rc4, log4 = _run_with_executor(x265_cmd)
+        if rc4 != 0:
+            msg = "ffmpeg timelapse failed across all decode paths (hevc_cuvid, h264_cuvid, normal) and CPU fallback\n"
+            detail = log4 or log3 or log2 or log
+            raise EncodeError(msg + (detail or ""))
 
     if backend == "cpu":
-        p = _run(x265_cmd)
-        if p.returncode != 0:
-            raise EncodeError("ffmpeg timelapse failed on CPU libx265 (forced)\n" + (p.stderr or ""))
+        rc, log = _run_with_executor(x265_cmd)
+        if rc != 0:
+            raise EncodeError("ffmpeg timelapse failed on CPU libx265 (forced)\n" + (log or ""))
     else:
         _try_chain()
 
@@ -1004,16 +863,17 @@ def _make_speedup_single(
         "-pix_fmt", "yuv420p",
         str(out),
     ]
-    proc = subprocess.run(hevc_nv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    if proc.returncode != 0:
-        proc2 = subprocess.run(h264_nv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        if proc2.returncode != 0:
-            proc3 = subprocess.run(nv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            if proc3.returncode != 0:
-                proc4 = subprocess.run(x, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-                if proc4.returncode != 0 or not out.exists():
+    rc, log = _run_with_executor(hevc_nv)
+    if rc != 0:
+        rc2, log2 = _run_with_executor(h264_nv)
+        if rc2 != 0:
+            rc3, log3 = _run_with_executor(nv)
+            if rc3 != 0:
+                rc4, log4 = _run_with_executor(x)
+                if rc4 != 0 or not out.exists():
+                    detail = log4 or log3 or log2 or log
                     raise EncodeError(
-                        "ffmpeg speedup failed across NVDec(hevc/h264), NVEnc, and CPU fallback\n"
+                        "ffmpeg speedup failed across NVDec(hevc/h264), NVEnc, and CPU fallback\n" + (detail or "")
                     )
     return str(out.resolve())
 
@@ -1022,22 +882,42 @@ def timelapse_merge_to_duration(
     segments: List[str],
     merged_out: str,
     *,
-    duration_sec: int = 900,
-    max_workers: int = 4,
+    target_frames: int = 27000,
     backend: Literal["auto", "gpu", "cpu"] = "auto",
     cpu_workers: int = 6,
     gpu_workers: int = 2,
     target_fps: int = 30,
 ) -> Tuple[str, float]:
     """
-    Create a timelapse whose total duration matches duration_sec exactly (± a few ms).
+    Create a timelapse whose total frames match `target_frames` at `target_fps` (± a small tolerance).
 
-    - Computes total input duration, derives a common speed factor S = total/duration.
+    - Computes total input duration, derives a common speed factor S = total_dur / target_duration
+      where target_duration = target_frames / target_fps (but will not slow down clips when the
+      source has fewer frames than requested).
     - Per-segment time-scale with CFR re-encode, then safe-concat with re-encode.
     - Returns: (merged_path, speed_factor)
     """
     if not segments:
         raise ValueError("No segments provided for timelapse_merge_to_duration")
+
+    target_frames = max(1, int(target_frames))
+    target_fps = max(1, int(target_fps))
+
+    target_duration_sec = target_frames / float(target_fps)
+
+    # Estimate total frames to decide whether to stretch; prefer frame count over duration
+    est_total_frames = 0
+    frames_unknown = False
+    for s in segments:
+        try:
+            n = count_frames(s)
+            if n is None:
+                frames_unknown = True
+                break
+            est_total_frames += n
+        except Exception:
+            frames_unknown = True
+            break
 
     # Sum durations
     total_dur = 0.0
@@ -1049,9 +929,17 @@ def timelapse_merge_to_duration(
         except Exception:
             pass
     if total_dur <= 0.0:
-        # Fallback: assume 30min to avoid divide by zero; S=2 for 15min target
+        # Fallback: assume 30min to avoid divide by zero
         total_dur = 1800.0
-    S = max(0.0001, total_dur / float(duration_sec))
+
+    # Avoid stretching when total frames (or duration) are already below the target
+    shorter_than_target = False
+    if not frames_unknown and est_total_frames > 0 and est_total_frames < target_frames:
+        shorter_than_target = True
+    elif frames_unknown and total_dur < target_duration_sec:
+        shorter_than_target = True
+
+    S = 1.0 if shorter_than_target else max(0.0001, total_dur / float(target_duration_sec))
 
     tmp_dir = Path(Path(merged_out).parent or ".") / f"tl_{get_uuid(8)}"
     tmp_dir.mkdir(parents=True, exist_ok=True)
@@ -1095,18 +983,32 @@ def timelapse_merge_to_duration(
     # Merge with safe re-encode
     merged_path = concat_videos_safe(out_paths, merged_out, backend=backend)
 
-    # Final duration correction to be exactly duration_sec (when small drift exists)
-    try:
-        meta = probe_video(merged_path)
-        dur = float(meta.get("durationSec") or 0.0)
-    except Exception:
-        dur = 0.0
-    if dur > 0.0 and abs(dur - float(duration_sec)) > 0.05:  # >50ms drift
-        corr = max(0.0001, dur / float(duration_sec))
-        corrected = str(Path(merged_out).with_suffix("").with_name(Path(merged_out).stem + "_corr.mp4"))
-        _make_speedup_single(merged_path, corrected, corr, backend=backend, target_fps=target_fps)
-        Path(merged_path).unlink(missing_ok=True)
-        Path(corrected).rename(merged_path)
+    # Final frame-count correction to be close to target_frames
+    actual_frames = count_frames(merged_path)
+    if actual_frames is not None:
+        tol_frames = max(3, int(target_frames * 0.01))  # allow small drift (>=3 frames or 1%)
+        # Only tighten when we exceed the requested frames; do not stretch shorter clips
+        if actual_frames > target_frames + tol_frames:
+            corr = max(0.0001, actual_frames / float(target_frames))
+            corrected = str(Path(merged_out).with_suffix("").with_name(Path(merged_out).stem + "_corr.mp4"))
+            _make_speedup_single(merged_path, corrected, corr, backend=backend, target_fps=target_fps)
+            Path(merged_path).unlink(missing_ok=True)
+            Path(corrected).rename(merged_path)
+            S *= corr
+    else:
+        # Fallback to duration-based correction when frame count is unavailable
+        try:
+            meta = probe_video(merged_path)
+            dur = float(meta.get("durationSec") or 0.0)
+        except Exception:
+            dur = 0.0
+        if dur > target_duration_sec and abs(dur - float(target_duration_sec)) > 0.05:
+            corr = max(0.0001, dur / float(target_duration_sec))
+            corrected = str(Path(merged_out).with_suffix("").with_name(Path(merged_out).stem + "_corr.mp4"))
+            _make_speedup_single(merged_path, corrected, corr, backend=backend, target_fps=target_fps)
+            Path(merged_path).unlink(missing_ok=True)
+            Path(corrected).rename(merged_path)
+            S *= corr
 
     # Cleanup temp parts
     try:

@@ -45,16 +45,15 @@
 
 ### Runtime Orchestrator
 - `video_manager.py`:
-  - Polls SurrealDB for queued encode jobs every `interval` seconds via `TaskRunner`.
-  - For each job: download the source file from S3/MinIO, encode into segmented MP4s, upload segments, register metadata, then update job status.
-  - Runs jobs concurrently with a `ThreadPoolExecutor` (default `max_workers=2`). Cleans up per-job work directories under `work/` regardless of success/failure.
+  - Polls SurrealDB for queued HLS jobs every `interval` seconds via `TaskRunner`.
+  - For each job: download the source file from S3/MinIO, encode to HLS (playlist + init + fMP4 segments), upload assets, register playlist/segment metadata, then update job status.
+  - Runs jobs with GPU/CPU executors (1 each) and cleans up per-job work directories under `work/` regardless of success/failure.
 
 ### Storage Layer
 - `backend_module/object_storage.py`:
   - `MinioS3Uploader`: thin wrapper around `boto3.client('s3')` configured for MinIO-compatible endpoints.
   - Uploads: `upload_file()` and `upload_files()` with automatic multipart based on `TransferConfig` thresholds. Returns `UploadResult` with status in `S3Info`.
   - Downloads: `download_file()` and `download_files()`; pre-checks existence with `head_object`; supports keeping S3 key path structure. Returns `DownloadResult` with `S3Info`.
-  - Streaming: `stream_object(key)` yields chunks for large-object streaming use cases.
   - Content-Type inference via `mimetypes`; stable path-style addressing for MinIO.
 
 ### Database Layer
@@ -64,20 +63,17 @@
 
 ### Encoding Layer
 - `backend_module/encoder.py`:
-  - `encode_to_segments(input_path, out_dir=None)`: splits video into ~180-second segments.
-    - Uses NVIDIA NVENC HEVC (`hevc_nvenc`) with sample-aligned flags; falls back to `libx265` if NVENC fails, raising `EncodeError` only if both fail.
-    - Outputs files under `<out_dir or input_dir/out>/<uuid>/out_###.mp4` and returns absolute paths.
+  - `encode_to_hls(input_path, out_dir=None)`: produces HLS VOD (fMP4) with playlist + init + `seg_XXXXX.m4s`, NVENC-first with libx265 fallback.
   - `probe_video(path)`: `ffprobe` wrapper to extract duration, width/height, frame rate, and codec.
-  - `encode_to_segments_links(...)`: convenience returning `file://` links for local consumption.
 
 ### Query Helpers
-- `query/encode_job_query.py`:
-  - `queue_unencoded_video_jobs(...)`: inserts queued jobs for files needing encode.
-  - Status transitions: `set_encode_job_status(...)` enforces allowed transitions with optimistic concurrency check. Allowed flow: `queued -> in_progress -> complete`; `faild` is always allowed. Raises `JobNotFound` or `InvalidJobTransition` on errors.
 - `query/file_query.py`:
   - `get_file(...)`, `get_s3key(...)`: fetch file record or its S3 key; raise `FileRecordNotFound` if missing.
 - `query/encoded_segment_query.py`:
   - `insert_encoded_segment(...)`: inserts one encoded segment record with file linkage, size, bucket, and rich `meta` (duration, index, time ranges, dimensions, fps, codec).
+- `query/hls_job_query.py`:
+  - `queue_unhls_video_jobs(...)`: enqueues HLS jobs for videos/results missing HLS.
+  - `set_hls_job_status(...)`: guards state transitions (`queued -> in_progress -> complete`, `faild` always allowed).
 - `query/utils.py`:
   - Response helpers `first_result(...)`, `extract_results(...)`, and Surreal record id utility `rid_leaf(...)`.
 
@@ -88,13 +84,12 @@
 - `test.py`: small, local example to download/upload using `MinioS3Uploader` with hardcoded endpoints and credentials.
 
 ## End-to-End Job Flow
-- Discover work: enqueue new `encode_job` for eligible `file` records.
-- Fetch queued jobs and mark each `in_progress` before processing.
-- Download the source object from S3/MinIO to a per-job `work/<job_id>/` directory.
-- Encode to segments; for each segment:
-  - Upload to `encoded/<file_id>/...` prefix.
-  - Insert `encoded_segment` row with calculated timing and video metadata.
-- Mark job `complete` on success; `faild` on any error. Always remove local `work/<job_id>/`.
+- Discover work: enqueue new `hls_job` for eligible `file`/`inference_result` records.
+- Fetch queued HLS jobs and mark each `in_progress` before processing.
+- Download the source object from S3/MinIO to a per-job `work/hls_<job_id>/` directory.
+- Encode to HLS (playlist + init + fMP4 segments), upload under `hls/<file_id>/...`.
+- Insert `hls_playlist`/`hls_segment` rows with timing and video metadata.
+- Mark job `complete` on success; `faild` on any error. Always remove local `work/hls_<job_id>/`.
 
 ## Configuration
 - Object storage: use environment variables and pass to `MinioS3Uploader`:
@@ -121,7 +116,7 @@
 ## Suggestions / TODOs
 - Replace hardcoded configuration in `video_manager.py` and `test.py` with environment variables and a small config loader.
 - Add minimal pytest coverage for:
-  - `encode_job` state transitions (valid/invalid, concurrent update guard).
+  - `hls_job` state transitions (valid/invalid, concurrent update guard).
   - `object_storage` error paths (missing keys, timeouts mocked).
   - `probe_video` parsing with fixture JSON.
 - Consider structured logging and per-job correlation IDs for observability.

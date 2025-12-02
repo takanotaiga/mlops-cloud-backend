@@ -4,9 +4,6 @@ import requests
 import shlex
 import time
 from typing import Tuple
-from backend_module.database import DataBaseManager
-from backend_module.config import load_surreal_config
-from query import encode_job_query, ml_inference_job_query
 
 
 def _cd_command(path: str) -> str:
@@ -135,27 +132,9 @@ def ssh_git_switch_detach(
 
 
 def main():
-    # DB client (for job status checks)
-    # sconf = load_surreal_config()
-    # dbm = DataBaseManager(
-    #     endpoint_url=sconf["endpoint_url"],
-    #     username=sconf["username"],
-    #     password=sconf["password"],
-    #     namespace=sconf["namespace"],
-    #     database=sconf["database"],
-    # )
-
     while True:
         try:
-            # enc_running = encode_job_query.has_in_progress_job(dbm)
-            # inf_running = ml_inference_job_query.has_in_progress_job(dbm)
-
             print("===== Job Progress Check =====")
-            # print("Encode job in progress:", enc_running)
-            # print("ML inference job in progress:", inf_running)
-
-            # if not enc_running and not inf_running:
-                # No running jobs -> deploy latest release
             rel = get_latest_github_release(owner="takanotaiga", repo="mlops-cloud")
             if not rel or not rel.get("tag"):
                 print("Skip deploy: failed to fetch latest release")

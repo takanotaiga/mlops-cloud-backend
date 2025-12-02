@@ -2,15 +2,14 @@ import time
 from pathlib import Path
 import shutil
 from typing import List
-from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 
 from backend_module.database import DataBaseManager
 from backend_module.object_storage import MinioS3Uploader, S3Info
 from backend_module.config import load_surreal_config, load_s3_config
-from backend_module.encoder import encode_to_segments, probe_video, create_thumbnail, encode_to_hls
-from query import encode_job_query, file_query
+from backend_module.encoder import probe_video, create_thumbnail, encode_to_hls
+from query import file_query
 from query import inference_result_query
-from query.encoded_segment_query import insert_encoded_segment
 from query import hls_job_query
 from query.hls_playlist_query import insert_hls_playlist
 from query.hls_segment_query import insert_hls_segment
@@ -52,108 +51,11 @@ class TaskRunner:
             # サムネイルを処理した場合は、このサイクルではここで終了（優先度を担保）
             return
 
-        # 新規ジョブをエンキュー（H264 MP4 / HLS）
-        encode_job_query.queue_unencoded_video_jobs(self.db_manager)
+        # 新規ジョブをエンキュー（HLS のみ）
         hls_job_query.queue_unhls_video_jobs(self.db_manager)
 
         # キュー取得（SurrealDBの応答形式を吸収）
-        jobs = encode_job_query.get_queued_job(self.db_manager)
         hls_jobs = hls_job_query.get_queued_job(self.db_manager)
-
-        def _process_job(job: dict, *, backend: str = "auto"):
-            job_id = job.get("id")
-            file_id = job.get("file")
-            if not job_id or not file_id:
-                return
-
-            work_dir = Path("work") / rid_leaf(job_id)
-            try:
-                # ステータスを in_progress へ
-                encode_job_query.set_encode_job_status(self.db_manager, job_id, "in_progress")
-
-                # S3キー取得（file または inference_result に対応）
-                sfile = str(file_id)
-                if sfile.startswith("inference_result:"):
-                    s3_key = inference_result_query.get_s3key(self.db_manager, file_id)
-                else:
-                    s3_key = file_query.get_s3key(self.db_manager, file_id)
-
-                # 作業ディレクトリ準備
-                work_dir.mkdir(parents=True, exist_ok=True)
-                filename = s3_key.rstrip("/").split("/")[-1]
-                local_src = work_dir / filename
-
-                # ダウンロード
-                dl_res = self.uploader.download_file(s3_key, str(local_src))
-                if dl_res.status != S3Info.SUCCESS:
-                    raise RuntimeError(f"Download failed: {dl_res.error}")
-
-                # エンコード（out/<uuid>/ に出力される）
-                outputs: List[str] = encode_to_segments(
-                    str(local_src), out_dir=str(work_dir / "encoded"), backend=backend
-                )
-
-                # アップロード（encoded/<file_id>/ 配下に格納）
-                upload_results = self.uploader.upload_files(outputs, key_prefix=f"encoded/{rid_leaf(file_id)}")
-                if any(r.status != S3Info.SUCCESS for r in upload_results):
-                    errs = ", ".join(f"{r.local_path}:{r.error}" for r in upload_results if r.status != S3Info.SUCCESS)
-                    raise RuntimeError(f"Upload failed: {errs}")
-
-                # DB 登録（各セグメントのメタ情報付与）
-                seg_infos = [probe_video(p) for p in outputs]
-                total = len(outputs)
-                cumulative = 0.0
-                # アップロード結果を local_path -> key で引けるようにする
-                path_to_key = {r.local_path: r.key for r in upload_results if r.status == S3Info.SUCCESS and r.key}
-                for idx, (local_path, info) in enumerate(zip(outputs, seg_infos), start=1):
-                    up_key = path_to_key.get(local_path)
-                    if not up_key:
-                        raise RuntimeError(f"Uploaded key missing for {local_path}")
-                    size = Path(local_path).stat().st_size
-                    start_sec = cumulative
-                    end_sec = cumulative + (info.get("durationSec") or 0.0)
-                    cumulative = end_sec
-                    meta = {
-                        "durationSec": info.get("durationSec"),
-                        "index": idx,  # 1-based, outputs の順序に一致
-                        "total": total,
-                        "startSec": start_sec,
-                        "endSec": end_sec,
-                        "startMin": start_sec / 60.0,
-                        "endMin": end_sec / 60.0,
-                        "width": info.get("width"),
-                        "height": info.get("height"),
-                        "nb_frames": info.get("nb_frames"),
-                        "avg_frame_rate": info.get("avg_frame_rate"),
-                        "codec_name": info.get("codec_name"),
-                    }
-                    insert_encoded_segment(
-                        self.db_manager,
-                        file_id=file_id,
-                        key=up_key,
-                        size=size,
-                        bucket=self.uploader.bucket,
-                        meta=meta,
-                    )
-
-                # ここまで完了したら complete へ
-                encode_job_query.set_encode_job_status(self.db_manager, job_id, "complete")
-
-            except Exception as e:
-                # いずれの段階でも失敗時は faild へ
-                try:
-                    encode_job_query.set_encode_job_status(self.db_manager, job_id, "faild")
-                except Exception:
-                    pass
-                # ログ代わりに出力
-                print(f"Job {job_id} failed: {e}")
-            finally:
-                # 成功・失敗を問わずローカル作業ディレクトリを削除
-                try:
-                    if work_dir.exists():
-                        shutil.rmtree(work_dir, ignore_errors=True)
-                except Exception:
-                    pass
 
         # HLS ジョブ処理
         def _process_hls_job(job: dict, *, backend: str = "auto"):
@@ -291,12 +193,9 @@ class TaskRunner:
                     pass
 
         # 新スケジューラ: GPU/CPU 各1並列で実行（GPU優先）
-        pending: list[tuple[str, dict]] = []
-        # HLS を先に並べ、次に通常エンコード
+        pending: list[dict] = []
         for j in (hls_jobs or []):
-            pending.append(("hls", j))
-        for j in (jobs or []):
-            pending.append(("encode", j))
+            pending.append(j)
 
         if not pending:
             return
@@ -311,17 +210,11 @@ class TaskRunner:
                 nonlocal gpu_future, cpu_future
                 if not pending:
                     return
-                kind, job = pending.pop(0)
+                job = pending.pop(0)
                 if resource == "gpu":
-                    if kind == "hls":
-                        gpu_future = gpu_ex.submit(_process_hls_job, job, backend="gpu")
-                    else:
-                        gpu_future = gpu_ex.submit(_process_job, job, backend="gpu")
+                    gpu_future = gpu_ex.submit(_process_hls_job, job, backend="gpu")
                 else:
-                    if kind == "hls":
-                        cpu_future = cpu_ex.submit(_process_hls_job, job, backend="cpu")
-                    else:
-                        cpu_future = cpu_ex.submit(_process_job, job, backend="cpu")
+                    cpu_future = cpu_ex.submit(_process_hls_job, job, backend="cpu")
 
             # まずGPUへ、次にCPUへ投げる
             if gpu_future is None:

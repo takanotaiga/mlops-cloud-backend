@@ -51,7 +51,6 @@ def get_s3key(db_manager: DataBaseManager, inference_result_id: str) -> str:
         "SELECT VALUE key FROM inference_result WHERE id = <record> $ID LIMIT 1",
         {"ID": inference_result_id},
     )
-    # Lazy import to avoid circulars
     from query.utils import first_result
 
     key = first_result(res)

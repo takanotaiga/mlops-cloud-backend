@@ -10,11 +10,60 @@ def get_queued_job(db_manager: DataBaseManager) -> List[dict]:
     )
     return extract_results(payload)
 
-def get_linked_file(db_manager: DataBaseManager, job_id: str) -> List[str]:
+def get_nonvideo_file_keys(db_manager: DataBaseManager, job_id: str) -> List[str]:
+    """Return keys from file table that are not video mime types for the job's datasets."""
     payload = db_manager.query(
-        "RETURN array::concat((SELECT VALUE key FROM file WHERE dataset INSIDE array::flatten((SELECT VALUE datasets FROM inference_job WHERE id = <record> $JOB_ID)) AND mime !~ 'video/'), (SELECT VALUE key FROM encoded_segment WHERE file.dataset INSIDE array::flatten((SELECT VALUE datasets FROM inference_job WHERE id = <record> $JOB_ID)) AND file.mime ~ 'video/'));",
-        {"JOB_ID" : job_id}
+        "SELECT VALUE key FROM file WHERE dataset INSIDE array::flatten((SELECT VALUE datasets FROM inference_job WHERE id = <record> $JOB_ID)) AND mime !~ 'video/';",
+        {"JOB_ID": job_id},
     )
+    return extract_results(payload)
+
+
+def get_encoded_video_keys(db_manager: DataBaseManager, job_id: str) -> List[str]:
+    """Return encoded_segment keys for video files in the job's datasets."""
+    payload = db_manager.query(
+        "SELECT VALUE key FROM encoded_segment WHERE file.dataset INSIDE array::flatten((SELECT VALUE datasets FROM inference_job WHERE id = <record> $JOB_ID)) AND file.mime ~ 'video/';",
+        {"JOB_ID": job_id},
+    )
+    return extract_results(payload)
+
+
+def get_hls_video_keys(db_manager: DataBaseManager, job_id: str) -> List[str]:
+    """Return playlist + segment keys for HLS variants of video files in the job's datasets."""
+    payload = db_manager.query(
+        """
+        RETURN array::concat(
+            (SELECT VALUE key FROM hls_playlist WHERE file.dataset INSIDE array::flatten((SELECT VALUE datasets FROM inference_job WHERE id = <record> $JOB_ID))),
+            (SELECT VALUE key FROM hls_segment WHERE file.dataset INSIDE array::flatten((SELECT VALUE datasets FROM inference_job WHERE id = <record> $JOB_ID)))
+        );
+        """,
+        {"JOB_ID": job_id},
+    )
+    return extract_results(payload)
+
+
+def get_linked_file(db_manager: DataBaseManager, job_id: str, *, prefer_hls: bool = False) -> List[str]:
+    """Return object keys required for the job.
+
+    When prefer_hls=True, returns non-video file keys plus HLS playlist/segment keys.
+    Otherwise returns non-video plus encoded_segment keys (legacy behavior).
+    """
+    if prefer_hls:
+        payload = db_manager.query(
+            """
+            RETURN array::concat(
+                (SELECT VALUE key FROM file WHERE dataset INSIDE array::flatten((SELECT VALUE datasets FROM inference_job WHERE id = <record> $JOB_ID)) AND mime !~ 'video/'),
+                (SELECT VALUE key FROM hls_playlist WHERE file.dataset INSIDE array::flatten((SELECT VALUE datasets FROM inference_job WHERE id = <record> $JOB_ID))),
+                (SELECT VALUE key FROM hls_segment WHERE file.dataset INSIDE array::flatten((SELECT VALUE datasets FROM inference_job WHERE id = <record> $JOB_ID)))
+            );
+            """,
+            {"JOB_ID": job_id},
+        )
+    else:
+        payload = db_manager.query(
+            "RETURN array::concat((SELECT VALUE key FROM file WHERE dataset INSIDE array::flatten((SELECT VALUE datasets FROM inference_job WHERE id = <record> $JOB_ID)) AND mime !~ 'video/'), (SELECT VALUE key FROM encoded_segment WHERE file.dataset INSIDE array::flatten((SELECT VALUE datasets FROM inference_job WHERE id = <record> $JOB_ID)) AND file.mime ~ 'video/'));",
+            {"JOB_ID" : job_id}
+        )
     return extract_results(payload)
 
 
@@ -70,15 +119,3 @@ def set_inference_job_status(db_manager: DataBaseManager, job_id: str, new_state
     if first_result(upd) is None:
         raise ValueError("Concurrent update detected; state changed by another process")
     return {"id": job_id, "status": new_state, "updated": True, "previous": current, "result": upd}
-
-
-def has_in_progress_job(db_manager: DataBaseManager) -> bool:
-    """進行中の推論ジョブが存在するかを返す。"""
-    payload = db_manager.query(
-        "SELECT VALUE count() FROM inference_job WHERE status = 'ProcessRunning';"
-    )
-    cnt = first_result(payload)
-    try:
-        return int(cnt or 0) > 0
-    except Exception:
-        return False

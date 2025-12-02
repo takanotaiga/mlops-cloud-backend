@@ -4,19 +4,6 @@ from backend_module.database import DataBaseManager
 from query.utils import extract_results
 
 
-def list_dead_file_keys(db_manager: DataBaseManager) -> List[str]:
-    """Return S3 keys from file rows marked as dead.
-
-    Runs: SELECT VALUE key FROM file WHERE dead = true;
-    """
-    payload = db_manager.query(
-        "SELECT VALUE key FROM file WHERE dead = true;"
-    )
-    results = extract_results(payload)
-    # Normalize to a clean list of non-empty strings
-    return [str(k) for k in results if isinstance(k, str) and k]
-
-
 def list_dead_file_records(db_manager: DataBaseManager) -> List[dict]:
     """Return [{ id, key, thumbKey? }] for file rows marked as dead."""
     payload = db_manager.query(
@@ -59,27 +46,6 @@ def delete_annotation_record(db_manager: DataBaseManager, rid: str):
         "DELETE annotation WHERE id = <record> $ID;",
         {"ID": rid},
     )
-
-
-def list_orphan_encode_jobs(db_manager: DataBaseManager) -> List[dict]:
-    """Return [{ id }] for encode_job rows whose file.id is NONE."""
-    payload = db_manager.query(
-        "SELECT id FROM encode_job WHERE file.id = NONE;"
-    )
-    rows = extract_results(payload)
-    out: List[dict] = []
-    for r in rows:
-        if isinstance(r, dict) and r.get("id"):
-            out.append({"id": r.get("id")})
-    return out
-
-
-def delete_encode_job_record(db_manager: DataBaseManager, rid: str):
-    return db_manager.query(
-        "DELETE encode_job WHERE id = <record> $ID;",
-        {"ID": rid},
-    )
-
 
 def list_orphan_encoded_segments(db_manager: DataBaseManager) -> List[dict]:
     """Return [{ id, key }] for encoded_segment rows whose file.id is NONE."""

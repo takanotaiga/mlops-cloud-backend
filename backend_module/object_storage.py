@@ -261,23 +261,6 @@ class MinioS3Uploader:
                 results.append(res)
         return results
 
-    def stream_object(self, key: str, chunk_size: int = 8 * 1024 * 1024):
-        """
-        S3オブジェクトをチャンク単位でストリーミングするジェネレータ。
-        大容量データを逐次処理する用途向け。
-        """
-        try:
-            resp = self.s3.get_object(Bucket=self.bucket, Key=key)
-        except (ClientError, BotoCoreError) as e:
-            code = getattr(e, "response", {}).get("Error", {}).get("Code") if hasattr(e, "response") else None
-            if code in {"404", "NoSuchKey", "NotFound"}:
-                return
-            raise
-        body = resp["Body"]
-        for chunk in body.iter_chunks(chunk_size):
-            if chunk:
-                yield chunk
-
     # --------- delete API ---------
 
     def delete_key(self, key: str) -> DeleteResult:

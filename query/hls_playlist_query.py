@@ -32,3 +32,18 @@ def insert_hls_playlist(
         },
     )
 
+
+def get_playlists_with_file_by_keys(db_manager: DataBaseManager, keys: list[str]):
+    """Return hls_playlist rows for given keys with joined file info."""
+    return db_manager.query(
+        """
+        SELECT
+            key,
+            file,
+            file.name AS file_name,
+            file.dataset AS file_dataset
+        FROM hls_playlist
+        WHERE key INSIDE $KEYS;
+        """,
+        {"KEYS": keys},
+    )
