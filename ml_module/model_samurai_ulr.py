@@ -474,8 +474,9 @@ class SamuraiULRModel:
                 p.mkdir(parents=True, exist_ok=True)
 
             df = pd.read_parquet(parquet_path)
-            # Map labels to class ids
-            label_names = sorted(df["label"].dropna().unique().tolist()) or sorted(set([s.label for s in seeds]))
+            # Map labels to class ids (fallback to seed labels, then to a dummy class)
+            seed_label_set = sorted(set([s.label for s in seeds if s.label])) or ["object"]
+            label_names = sorted(df["label"].dropna().unique().tolist()) or seed_label_set
             cls_map = {name: i for i, name in enumerate(label_names)}
             # Per-frame grouping to write one label file per image
             g = df.groupby("frame_index")
@@ -483,9 +484,15 @@ class SamuraiULRModel:
             # Deterministic random split based on file id
             seed_val = abs(hash(str(fid))) % (2**32)
             rnd = random.Random(seed_val)
-            for fi in range(frame_count):
-                frame_file = os.path.join(frames_dir, f"{fi + 1:08d}.jpg")
-                if not os.path.exists(frame_file):
+            frame_files = sorted(Path(frames_dir).glob("*.jpg"))
+            if not frame_files:
+                raise RuntimeError("No frames extracted for YOLO export")
+            for frame_path in frame_files:
+                try:
+                    fi = int(frame_path.stem) - 1
+                except Exception:
+                    fi = None
+                if fi is None:
                     continue
                 # Split 80/10/10 train:val:test
                 r = rnd.random()
@@ -499,8 +506,8 @@ class SamuraiULRModel:
                     split = "test"
                     img_dir, lbl_dir = images_test, labels_test
                 # Copy image into dataset images
-                out_img = img_dir / f"{fi + 1:08d}.jpg"
-                shutil.copy2(frame_file, out_img)
+                out_img = img_dir / frame_path.name
+                shutil.copy2(frame_path, out_img)
                 # Write YOLO label .txt
                 out_lbl = lbl_dir / f"{fi + 1:08d}.txt"
                 rows = []
@@ -513,7 +520,7 @@ class SamuraiULRModel:
                         yc = (int(r["y"]) + int(r["h"]) / 2.0) / float(height)
                         nw = int(r["w"]) / float(width)
                         nh = int(r["h"]) / float(height)
-                        cname = str(r["label"]) if not pd.isna(r["label"]) else seeds[0].label
+                        cname = str(r["label"]) if not pd.isna(r["label"]) else seed_label_set[0]
                         cid = cls_map.get(cname, 0)
                         rows.append(f"{cid} {xc:.6f} {yc:.6f} {nw:.6f} {nh:.6f}")
                 except Exception:
