@@ -191,6 +191,7 @@ def _plot_on_video_from_parquet(video_path: str, results_parquet: str, out_path:
 from pathlib import Path
 from query.annotation_query import get_key_bboxes_for_file
 from backend_module.encoder import (
+    concat_videos,
     concat_videos_safe,
     timelapse_merge_to_duration,
     timelapse_single,
@@ -200,7 +201,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import shutil
 
 
-from backend_module.progress_tracker import InferenceJobProgressTracker, StepState
+from backend_module.progress_tracker import InferenceJobProgressTracker
 
 
 class SamuraiULRModel:
@@ -233,12 +234,16 @@ class SamuraiULRModel:
             tracker = None
 
         failed_steps: set[str] = set()
+        started_steps: set[str] = set()
 
         def start_step(step_key: str) -> None:
+            if step_key in started_steps:
+                return
             try:
                 tracker.start(step_key) if tracker else None
             except Exception:
                 pass
+            started_steps.add(step_key)
 
         def complete_step(step_key: str) -> None:
             if step_key in failed_steps:
@@ -247,6 +252,7 @@ class SamuraiULRModel:
                 tracker.complete(step_key) if tracker else None
             except Exception:
                 pass
+            started_steps.add(step_key)
 
         def fail_step(step_key: str) -> None:
             failed_steps.add(step_key)
@@ -254,16 +260,14 @@ class SamuraiULRModel:
                 tracker.fail(step_key) if tracker else None
             except Exception:
                 pass
-
-        # Preprocess step begins at the first file
-        preprocess_started = False
+            started_steps.add(step_key)
 
         train_started = False
         infer_started = False
         dataset_started = False
+        sam2_started = False
 
         # Group-level controls
-        per_file_infer_enabled = False  # Disable per-file inference; run once over merged group instead
         global_model_path: Optional[str] = None  # Model chosen from first successful train/export
         # Flatten all original segments across the group in member order
         group_seg_paths: List[str] = []
@@ -273,14 +277,12 @@ class SamuraiULRModel:
         # Build a single fixed-duration timelapse (15 minutes) once per group
         merged_ready = False
         merged = str(work / "group_merged_timelapse.mp4")
+        start_step("preprocess")
         for item in file_group:
             fid = item.get("file_id")
             segs = item.get("segments") or []
             if not segs:
                 continue
-            # 1) Timelapse each segment in parallel to achieve 15-minute total duration
-            if not preprocess_started:
-                start_step("preprocess")
             # Build a single timelapse video for the whole merge group (only once)
             if not merged_ready and not os.path.exists(merged):
                 try:
@@ -325,7 +327,22 @@ class SamuraiULRModel:
                     _speed(tmp_tl, merged, max(0.0001, speed))
                     print(f"[samurai/preprocess] single speedup fallback done  -> {merged}")
                     merged_ready = True
+                except Exception:
+                    fail_step("preprocess")
+                    raise RuntimeError("Preprocess failed for group timelapse.")
 
+        if merged_ready:
+            complete_step("preprocess")
+        elif not merged_ready:
+            fail_step("preprocess")
+            raise RuntimeError("Preprocess could not produce merged timelapse.")
+
+        any_seeds_found = False
+        for item in file_group:
+            fid = item.get("file_id")
+            segs = item.get("segments") or []
+            if not segs:
+                continue
             # fetch seed boxes from annotations for this file
             anns = get_key_bboxes_for_file(db_manager, fid)
             seeds: List[SeedBox] = []
@@ -338,6 +355,8 @@ class SamuraiULRModel:
                     ))
                 except Exception:
                     continue
+            if seeds:
+                any_seeds_found = True
             # Proceed with SAM2/dataset/train only if we have seeds and no model selected yet
             if not seeds:
                 # No seeds on this file; move on to next file (training remains pending)
@@ -349,12 +368,10 @@ class SamuraiULRModel:
             _ensure_dir(frames_dir)
             # Frame count is no longer used for gating; proceed to extraction directly
             frame_count, width, height, fps = _extract_frames(merged, frames_dir)
-            if not preprocess_started:
-                complete_step("preprocess")
-                preprocess_started = True
 
             # Start SAM2 immediately after preprocess for clarity in UI
             start_step("sam2")
+            sam2_started = True
 
             # Run predict strictly one key per call using CLI and collect results
             # Then merge per-seed parquet files into a single parquet for this file
@@ -391,8 +408,8 @@ class SamuraiULRModel:
                     continue
 
             if sam2_failed:
-                # Skip downstream steps for this file when SAM2 CLI fails
-                continue
+                # Fail fast for group when SAM2 CLI fails
+                raise RuntimeError("SAM2 inference failed; see logs for details.")
 
             # Merge per-seed parquet files and add metadata columns for the whole group
             parquet_path = str(work / "group_results.parquet")
@@ -474,6 +491,7 @@ class SamuraiULRModel:
             try:
                 if not dataset_started:
                     start_step("dataset_export")
+                    dataset_started = True
                 # Place dataset under /workspace/src/datasets per RT-DETR spec
                 datasets_base = Path("/workspace/src/datasets")
                 dataset_name = f"yolo_dataset_{Path(str(fid)).name}"
@@ -572,12 +590,10 @@ class SamuraiULRModel:
                             f"names: {label_names}",
                         ])
                     )
-                if not dataset_started:
-                    complete_step("dataset_export")
-                    dataset_started = True
+                complete_step("dataset_export")
             except Exception:
-                # Dataset export is best-effort; continue even if it fails
-                pass
+                fail_step("dataset_export")
+                raise
 
             # 3) Train RT-DETR via CLI and optionally export TensorRT
             if not train_started:
@@ -598,6 +614,7 @@ class SamuraiULRModel:
             ])
             if rc != 0:
                 fail_step("rtdetr_train")
+                raise RuntimeError("RT-DETR training failed.")
             if rc == 0 and train_json.exists():
                 import json
                 with open(train_json, "r", encoding="utf-8") as f:
@@ -605,6 +622,11 @@ class SamuraiULRModel:
                 model_pt = train_res.get("pt")
             else:
                 model_pt = None
+            if model_pt:
+                complete_step("rtdetr_train")
+            else:
+                fail_step("rtdetr_train")
+                raise RuntimeError("RT-DETR training did not produce weights.")
 
             try:
                 model_engine = None
@@ -649,6 +671,7 @@ class SamuraiULRModel:
                                 complete_step("trt_export")
                             else:
                                 fail_step("trt_export")
+                                raise RuntimeError("TensorRT export failed.")
                         # Update cache with result (including None to avoid repeated attempts)
                         with _TRT_EXPORT_LOCK:
                             _TRT_EXPORT_CACHE[str(model_pt)] = model_engine
@@ -656,19 +679,24 @@ class SamuraiULRModel:
                 # Pick an inference model path preference: engine > pt
                 model_path = model_engine or model_pt
             except Exception as _e:
-                # If training/export fails, skip downstream inference
-                model_path = None
+                fail_step("trt_export")
+                raise
 
             # Capture model path for later group-level inference
             if model_path and (global_model_path is None):
                 global_model_path = model_path
+
+        if not any_seeds_found:
+            if not sam2_started:
+                start_step("sam2")
+            fail_step("sam2")
+            raise RuntimeError("No seed boxes found in group; aborting.")
 
         # After preparing model (from first seeded file), run inference once over the entire group
         final_path: Optional[str] = None
         group_parquet: Optional[str] = None
         if global_model_path and group_seg_paths:
             if not infer_started:
-                complete_step("rtdetr_train") if train_started else None
                 start_step("rtdetr_infer")
                 infer_started = True
 
@@ -707,12 +735,14 @@ class SamuraiULRModel:
                             seg_results_all[si] = p
             if infer_failed:
                 fail_step("rtdetr_infer")
+                raise RuntimeError("RT-DETR inference failed.")
 
             # Aggregate across all segments in the group
             aggregate_started = False
             try:
                 if not aggregate_started:
                     start_step("aggregate")
+                    aggregate_started = True
                 seg_frame_counts: List[int] = []
                 for sp in group_seg_paths:
                     try:
@@ -759,11 +789,14 @@ class SamuraiULRModel:
                 except Exception:
                     final_path = concat_path
             except Exception:
-                pass
+                fail_step("aggregate")
+                raise
             finally:
-                if not aggregate_started:
+                if aggregate_started and "aggregate" not in failed_steps:
                     complete_step("aggregate")
-                    aggregate_started = True
+        else:
+            fail_step("rtdetr_infer")
+            raise RuntimeError("No trained/exported model available for inference.")
 
         # If we could not produce a final group-level video, fallback to previous per-file outputs
         if not final_path:
