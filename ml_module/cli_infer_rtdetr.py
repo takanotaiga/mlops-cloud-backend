@@ -28,7 +28,7 @@ def run_inference(model_path: str, video_path: str, *, out_parquet: str, out_vid
 
     rows: List[Dict[str, Any]] = []
     frame_idx = -1
-    for results in model.predict(video_path, stream=True, verbose=False, conf=conf, imgsz=imgsz):
+    for results in model.predict(video_path, stream=True, verbose=True, conf=conf, imgsz=imgsz):
         frame_idx += 1
         names = results.names if hasattr(results, "names") else {}
         # boxes.xywh, boxes.cls
