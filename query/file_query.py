@@ -123,3 +123,43 @@ def mark_file_dead(db_manager: DataBaseManager, file_id: str):
         """,
         {"ID": file_id},
     )
+
+
+def update_file_after_hls_repack(
+    db_manager: DataBaseManager,
+    file_id: str,
+    *,
+    new_key: str,
+    name: str,
+    size: int,
+    mime: str,
+    bucket: str,
+    encode: str,
+    source_key: str | None = None,
+):
+    """Replace file key/size/mime/bucket after HLS repack and mark provenance."""
+    return db_manager.query(
+        """
+        UPDATE file SET
+            key = $KEY,
+            name = $NAME,
+            size = $SIZE,
+            mime = $MIME,
+            bucket = $BUCKET,
+            encode = $ENCODE,
+            meta.repackedFrom = $SRC,
+            meta.repackedAt = time::now()
+        WHERE id = <record> $ID
+        RETURN AFTER;
+        """,
+        {
+            "ID": file_id,
+            "KEY": new_key,
+            "NAME": name,
+            "SIZE": size,
+            "MIME": mime,
+            "BUCKET": bucket,
+            "ENCODE": encode,
+            "SRC": source_key,
+        },
+    )
