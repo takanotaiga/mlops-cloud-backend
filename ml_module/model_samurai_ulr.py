@@ -278,6 +278,7 @@ class SamuraiULRModel:
         merged_ready = False
         merged = str(work / "group_merged_timelapse.mp4")
         start_step("preprocess")
+        print(f"[samurai] job={job_id} preprocess start segments={len(group_seg_paths)}")
         for item in file_group:
             fid = item.get("file_id")
             segs = item.get("segments") or []
@@ -357,6 +358,7 @@ class SamuraiULRModel:
                     continue
             if seeds:
                 any_seeds_found = True
+            print(f"[samurai] job={job_id} file={fid} seeds={len(seeds)}")
             # Proceed with SAM2/dataset/train only if we have seeds and no model selected yet
             if not seeds:
                 # No seeds on this file; move on to next file (training remains pending)
@@ -612,6 +614,7 @@ class SamuraiULRModel:
                 "--base-model", "rtdetr-l.pt",
                 "--result", str(train_json),
             ])
+            print(f"[samurai] job={job_id} train rc={rc} out={train_json}")
             if rc != 0:
                 fail_step("rtdetr_train")
                 raise RuntimeError("RT-DETR training failed.")
@@ -620,6 +623,7 @@ class SamuraiULRModel:
                 with open(train_json, "r", encoding="utf-8") as f:
                     train_res = json.load(f)
                 model_pt = train_res.get("pt")
+                print(f"[samurai] job={job_id} train pt={model_pt}")
             else:
                 model_pt = None
             if model_pt:
@@ -661,6 +665,7 @@ class SamuraiULRModel:
                                 "--weights", str(model_pt),
                                 "--result", str(export_json),
                             ])
+                            print(f"[samurai] job={job_id} trt_export rc={rc2} result={export_json}")
                             if rc2 == 0 and export_json.exists():
                                 try:
                                     with open(export_json, "r", encoding="utf-8") as f:
@@ -685,6 +690,7 @@ class SamuraiULRModel:
             # Capture model path for later group-level inference
             if model_path and (global_model_path is None):
                 global_model_path = model_path
+                print(f"[samurai] job={job_id} model_selected={global_model_path}")
 
         if not any_seeds_found:
             if not sam2_started:
@@ -696,6 +702,7 @@ class SamuraiULRModel:
         final_path: Optional[str] = None
         group_parquet: Optional[str] = None
         if global_model_path and group_seg_paths:
+            print(f"[samurai] job={job_id} start rtdetr_infer model={global_model_path}")
             if not infer_started:
                 start_step("rtdetr_infer")
                 infer_started = True
@@ -807,6 +814,7 @@ class SamuraiULRModel:
                 concat_videos(per_file_outputs, final_path)
             else:
                 final_path = per_file_outputs[0]
+            print(f"[samurai] job={job_id} using_fallback_video={final_path}")
 
         # If any group parquet exists, select the first for upload at group level
         group_parquet = group_parquet_paths[0] if group_parquet_paths else None
