@@ -197,7 +197,6 @@ from backend_module.encoder import (
     timelapse_single,
 )
 from backend_module.command_executer import cmd_exec
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import shutil
 
 
@@ -707,94 +706,53 @@ class SamuraiULRModel:
                 start_step("rtdetr_infer")
                 infer_started = True
 
-            infer_failed = False
+            # Build a single inference input to avoid feeding raw HLS segments
+            infer_input: Optional[str] = None
+            try:
+                needs_concat = len(group_seg_paths) > 1 or any(
+                    Path(p).suffix.lower() in {".ts", ".m4s", ".mkv", ".mov", ".flv"} for p in group_seg_paths
+                )
+                if needs_concat:
+                    infer_input = str(work / "group_concat_infer.mp4")
+                    print(f"[samurai] job={job_id} concat for infer -> {infer_input}")
+                    concat_videos_safe(group_seg_paths, infer_input)
+                else:
+                    infer_input = group_seg_paths[0]
+                if not infer_input or not os.path.exists(infer_input):
+                    raise RuntimeError("Inference input missing after concat.")
+            except Exception:
+                fail_step("rtdetr_infer")
+                raise
 
-            def _infer_one_group(seg_path: str, seg_index: int) -> Optional[Tuple[int, str]]:
-                nonlocal infer_failed
-                try:
-                    out_parquet = str(work / f"group_seg{seg_index:03d}_infer.parquet")
-                    out_video = str(work / f"group_seg{seg_index:03d}_infer.mp4")
-                    out_json = str(work / f"group_seg{seg_index:03d}_infer.json")
-                    rc = cmd_exec([
-                        "uv", "run", "-m", "ml_module.cli_infer_rtdetr",
-                        "--model", str(global_model_path),
-                        "--video", str(seg_path),
-                        "--out-parquet", out_parquet,
-                        "--out-video", out_video,
-                        "--result", out_json,
-                    ])
-                    if rc != 0:
-                        infer_failed = True
-                        return None
-                    return (seg_index, out_parquet) if os.path.exists(out_parquet) else None
-                except Exception:
-                    infer_failed = True
-                    return None
-
-            seg_results_all: Dict[int, str] = {}
-            with ThreadPoolExecutor(max_workers=10) as ex:
-                futs = [ex.submit(_infer_one_group, sp, si) for si, sp in enumerate(group_seg_paths)]
-                for fu in as_completed(futs):
-                    r = fu.result()
-                    if r and isinstance(r, tuple) and len(r) == 2:
-                        si, p = r
-                        if isinstance(si, int) and isinstance(p, str):
-                            seg_results_all[si] = p
-            if infer_failed:
+            out_parquet = str(work / "group_infer.parquet")
+            out_video = str(work / "group_infer.mp4")
+            out_json = str(work / "group_infer.json")
+            rc = cmd_exec([
+                "uv", "run", "-m", "ml_module.cli_infer_rtdetr",
+                "--model", str(global_model_path),
+                "--video", str(infer_input),
+                "--out-parquet", out_parquet,
+                "--out-video", out_video,
+                "--result", out_json,
+            ])
+            print(f"[samurai] job={job_id} rtdetr_infer rc={rc} input={infer_input}")
+            if rc != 0 or not os.path.exists(out_parquet):
                 fail_step("rtdetr_infer")
                 raise RuntimeError("RT-DETR inference failed.")
 
-            # Aggregate across all segments in the group
             aggregate_started = False
             try:
                 if not aggregate_started:
                     start_step("aggregate")
                     aggregate_started = True
-                seg_frame_counts: List[int] = []
-                for sp in group_seg_paths:
-                    try:
-                        seg_frame_counts.append(_get_total_frame_count(sp))
-                    except Exception:
-                        seg_frame_counts.append(0)
-                offsets: List[int] = []
-                total = 0
-                for cnt in seg_frame_counts:
-                    offsets.append(total)
-                    total += int(cnt or 0)
-
-                dfs_all: List[pd.DataFrame] = []
-                for si in range(len(group_seg_paths)):
-                    p = seg_results_all.get(si)
-                    if not p:
-                        continue
-                    try:
-                        df = pd.read_parquet(p)
-                    except Exception:
-                        continue
-                    if "frame_index" in df.columns:
-                        try:
-                            df["frame_index"] = df["frame_index"].astype(int) + int(offsets[si])
-                        except Exception:
-                            pass
-                    dfs_all.append(df)
-
-                df_all = pd.concat(dfs_all, ignore_index=True) if dfs_all else pd.DataFrame()
-                group_parquet = str(work / "group_infer_merged.parquet")
-                df_all.to_parquet(group_parquet, index=False)
+                group_parquet = out_parquet
                 group_parquet_paths.append(group_parquet)
-
-                # Overlay on fully concatenated original video
-                concat_path = str(work / "group_concat.mp4")
-                try:
-                    concat_videos(group_seg_paths, concat_path)
-                except Exception:
-                    if group_seg_paths:
-                        concat_path = group_seg_paths[0]
-                try:
+                # Prefer inference-rendered video; if missing, plot ourselves
+                if os.path.exists(out_video):
+                    final_path = out_video
+                else:
                     final_path = str(work / "group_rtdetr_tracked.mp4")
-                    _plot_on_video_from_parquet(concat_path, group_parquet, final_path)
-                except Exception:
-                    final_path = concat_path
+                    _plot_on_video_from_parquet(infer_input, group_parquet, final_path)
             except Exception:
                 fail_step("aggregate")
                 raise
