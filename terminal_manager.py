@@ -7,7 +7,7 @@ from typing import Optional
 
 import paramiko
 import websockets
-from websockets.server import WebSocketServerProtocol
+from websockets.legacy.server import WebSocketServerProtocol
 
 
 # Websocket bind settings
@@ -21,8 +21,8 @@ def _get_env(name: str, default: Optional[str] = None) -> Optional[str]:
 
 
 # SSH target (host machine)
-DEFAULT_SSH_USER = _get_env("SSH_USERNAME", "")
-DEFAULT_SSH_PASS = _get_env("SSH_PASSWORD", "")
+DEFAULT_SSH_HOST = _get_env("TERMINAL_SSH_HOST") or _get_env("SSH_HOST") or _get_env("DOCKER_HOST_IP") or "172.17.0.1"
+DEFAULT_SSH_PORT = int(_get_env("SSH_PORT", "22"))
 DEFAULT_TERM = _get_env("TERMINAL_TERM", "xterm-256color")
 DEFAULT_ROWS = int(_get_env("TERMINAL_ROWS", "24"))
 DEFAULT_COLS = int(_get_env("TERMINAL_COLS", "80"))
@@ -38,14 +38,15 @@ class TerminalSession:
     closed: bool = False
 
 
-def _connect_ssh(cols: int, rows: int) -> TerminalSession:
+def _connect_ssh(username: str, password: str, cols: int, rows: int) -> TerminalSession:
     """Establish an SSH session to the host and start an interactive shell with PTY."""
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     client.connect(
-        hostname="172.17.0.1",
-        username=DEFAULT_SSH_USER,
-        password=DEFAULT_SSH_PASS,
+        hostname=DEFAULT_SSH_HOST,
+        port=DEFAULT_SSH_PORT,
+        username=username,
+        password=password,
         allow_agent=False,
         look_for_keys=False,
     )
@@ -67,16 +68,27 @@ async def _pump_pty_output(session: TerminalSession, websocket: WebSocketServerP
             data = await loop.run_in_executor(None, chan.recv, 1024)
             if not data:
                 break
-            await websocket.send(
-                json.dumps({"type": "output", "sessionId": session.session_id, "data": data.decode(errors="ignore")})
-            )
+            try:
+                await websocket.send(
+                    json.dumps(
+                        {"type": "output", "sessionId": session.session_id, "data": data.decode(errors="ignore")}
+                    )
+                )
+            except websockets.exceptions.ConnectionClosed:
+                break
     finally:
         try:
             exit_code = chan.recv_exit_status()
         except Exception:
             exit_code = None
-        await websocket.send(json.dumps({"type": "exit", "sessionId": session.session_id, "code": exit_code}))
-        await websocket.close()
+        try:
+            await websocket.send(json.dumps({"type": "exit", "sessionId": session.session_id, "code": exit_code}))
+        except websockets.exceptions.ConnectionClosed:
+            pass
+        try:
+            await websocket.close()
+        except websockets.exceptions.ConnectionClosed:
+            pass
 
 
 async def _handle_client_messages(session: TerminalSession, websocket: WebSocketServerProtocol) -> None:
@@ -106,10 +118,54 @@ async def _handle_client_messages(session: TerminalSession, websocket: WebSocket
             await websocket.send(json.dumps({"type": "pong", "sessionId": session.session_id}))
 
 
+async def _require_auth(websocket: WebSocketServerProtocol) -> Optional[dict]:
+    """Parse the initial auth frame containing SSH credentials."""
+    try:
+        raw = await websocket.recv()
+    except websockets.exceptions.ConnectionClosed:
+        return None
+
+    try:
+        msg = json.loads(raw)
+    except json.JSONDecodeError:
+        await websocket.send(json.dumps({"type": "error", "message": "invalid_json"}))
+        await websocket.close()
+        return None
+
+    if msg.get("type") != "auth":
+        await websocket.send(json.dumps({"type": "error", "message": "expected_auth"}))
+        await websocket.close()
+        return None
+
+    username = msg.get("username")
+    password = msg.get("password")
+    if not isinstance(username, str) or not isinstance(password, str) or not username or not password:
+        await websocket.send(json.dumps({"type": "error", "message": "missing_credentials"}))
+        await websocket.close()
+        return None
+
+    try:
+        cols = int(msg.get("cols", DEFAULT_COLS))
+        rows = int(msg.get("rows", DEFAULT_ROWS))
+    except (TypeError, ValueError):
+        cols = DEFAULT_COLS
+        rows = DEFAULT_ROWS
+    return {"username": username, "password": password, "cols": cols, "rows": rows}
+
+
 async def _handle_connection(websocket: WebSocketServerProtocol) -> None:
     """Accept a websocket connection and bind it to a new SSH shell session."""
+    auth = await _require_auth(websocket)
+    if not auth:
+        return
+
     try:
-        session = _connect_ssh(cols=DEFAULT_COLS, rows=DEFAULT_ROWS)
+        session = _connect_ssh(
+            username=auth["username"],
+            password=auth["password"],
+            cols=auth["cols"],
+            rows=auth["rows"],
+        )
     except Exception as exc:
         await websocket.send(json.dumps({"type": "error", "message": f"ssh_connect_failed: {exc}"}))
         await websocket.close()

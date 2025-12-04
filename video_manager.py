@@ -1,19 +1,22 @@
 import time
 from pathlib import Path
 import shutil
+import mimetypes
 from typing import List
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 
 from backend_module.database import DataBaseManager
 from backend_module.object_storage import MinioS3Uploader, S3Info
 from backend_module.config import load_surreal_config, load_s3_config
-from backend_module.encoder import probe_video, create_thumbnail, encode_to_hls
+from backend_module.encoder import probe_video, create_thumbnail, encode_to_hls, concat_videos, hls_to_mp4
+from backend_module.uuid_tools import get_uuid
 from query import file_query
 from query import inference_result_query
 from query import hls_job_query
-from query.hls_playlist_query import insert_hls_playlist
-from query.hls_segment_query import insert_hls_segment
-from query.utils import rid_leaf
+from query import merge_group_query
+from query.hls_playlist_query import insert_hls_playlist, get_playlist_for_file
+from query.hls_segment_query import insert_hls_segment, list_segments_for_file
+from query.utils import rid_leaf, first_result
  
 
 class TaskRunner:
@@ -46,9 +49,17 @@ class TaskRunner:
         self.next_time = time.time()
 
     def task_main(self):
+        # Merge multi-part videos defined in merge_group into a single video (copy concat)
+        if self._process_merge_groups():
+            return
+
         # 1) サムネイル作成（優先処理）
         if self._process_missing_thumbnails():
             # サムネイルを処理した場合は、このサイクルではここで終了（優先度を担保）
+            return
+
+        # Completed HLS jobs -> repackage HLS segments into a single MP4 (copy)
+        if self._process_hls_repack_to_mp4():
             return
 
         # 新規ジョブをエンキュー（HLS のみ）
@@ -242,6 +253,111 @@ class TaskRunner:
             gpu_ex.shutdown(wait=True)
             cpu_ex.shutdown(wait=True)
 
+    def _process_hls_repack_to_mp4(self) -> bool:
+        """
+        Convert completed HLS assets back into a single MP4 (copy) and swap the file key.
+
+        Returns True if a file was processed (success or failure) to throttle the loop.
+        """
+        res = self.db_manager.query(
+            """
+            SELECT id, key, dataset, name, bucket, mime
+            FROM file
+            WHERE encode = 'video-none'
+              AND id INSIDE (SELECT VALUE file FROM hls_job WHERE status = 'complete')
+            LIMIT 1;
+            """
+        )
+        target = first_result(res)
+        if not target:
+            return False
+
+        file_id = target.get("id")
+        orig_key = target.get("key")
+        if not file_id or not orig_key:
+            return False
+
+        dataset = target.get("dataset")
+        current_name = target.get("name") or Path(orig_key).name
+        bucket = target.get("bucket") or self.uploader.bucket
+        mime = target.get("mime") or "video/mp4"
+
+        work_dir = Path("work_hls_repack") / rid_leaf(file_id)
+        try:
+            work_dir.mkdir(parents=True, exist_ok=True)
+
+            playlist_row = get_playlist_for_file(self.db_manager, file_id)
+            if not playlist_row or not playlist_row.get("key"):
+                raise RuntimeError("Missing HLS playlist for file")
+            playlist_key = playlist_row.get("key")
+
+            seg_rows = list_segments_for_file(self.db_manager, file_id)
+            segment_keys = [r.get("key") for r in seg_rows if isinstance(r, dict) and r.get("key")]
+            if not segment_keys:
+                raise RuntimeError("No HLS segments registered for file")
+
+            dl_results = self.uploader.download_files(keys=[playlist_key, *segment_keys], dest_dir=work_dir)
+            key_to_local = {
+                r.key: r.local_path for r in dl_results if r.status == S3Info.SUCCESS and r.local_path
+            }
+            failed = [r.key for r in dl_results if r.status != S3Info.SUCCESS]
+            if failed:
+                raise RuntimeError(f"Download failed for: {failed}")
+
+            playlist_local = key_to_local.get(playlist_key)
+            if not playlist_local:
+                raise RuntimeError("Downloaded playlist not found locally")
+
+            stem = Path(current_name).stem or rid_leaf(file_id)
+            out_local = work_dir / f"{stem}_hls.mp4"
+            hls_to_mp4(str(playlist_local), str(out_local))
+            if not out_local.exists():
+                raise RuntimeError("HLS repack output missing")
+
+            dataset_prefix = str(dataset).strip("/") if dataset else ""
+            if not dataset_prefix and orig_key:
+                dataset_prefix = str(Path(orig_key).parent).strip("/")
+            if dataset_prefix == ".":
+                dataset_prefix = ""
+            new_name = out_local.name
+            new_key = f"{dataset_prefix}/{new_name}" if dataset_prefix else new_name
+            if orig_key == new_key:
+                new_key = f"{dataset_prefix}/{stem}-{get_uuid(8)}.mp4" if dataset_prefix else f"{stem}-{get_uuid(8)}.mp4"
+
+            upload = self.uploader.upload_file_as(str(out_local), new_key)
+            if upload.status != S3Info.SUCCESS:
+                raise RuntimeError(f"Upload repacked MP4 failed: {upload.error}")
+
+            new_size = out_local.stat().st_size
+            new_mime = mimetypes.guess_type(out_local.name)[0] or mime
+
+            file_query.update_file_after_hls_repack(
+                self.db_manager,
+                file_id,
+                new_key=new_key,
+                name=new_name,
+                size=new_size,
+                mime=new_mime,
+                bucket=bucket,
+                encode="video-hls-repacked",
+                source_key=orig_key,
+            )
+
+            del_res = self.uploader.delete_key(orig_key)
+            if del_res.status != S3Info.SUCCESS:
+                raise RuntimeError(f"Delete original video failed: {del_res.error}")
+
+        except Exception as e:
+            print(f"HLS repack failed for {file_id}: {e}")
+        finally:
+            try:
+                if work_dir.exists():
+                    shutil.rmtree(work_dir, ignore_errors=True)
+            except Exception:
+                pass
+
+        return True
+
     def _process_missing_thumbnails(self) -> bool:
         """Create and register thumbnails for videos missing thumbKey.
 
@@ -300,6 +416,126 @@ class TaskRunner:
                     pass
 
         return True
+
+    def _process_merge_groups(self) -> bool:
+        """
+        Build a single concatenated video for each merge_group entry (copy, no re-encode).
+
+        Returns True if any merge was performed to throttle the cycle.
+        """
+        groups = merge_group_query.list_pending_merge_groups(self.db_manager)
+        if not groups:
+            return False
+
+        for mg in groups:
+            mg_id = mg.get("id")
+            dataset = mg.get("dataset")
+            members = mg.get("members") or []
+            if not dataset or not members:
+                continue
+
+            target_name = f"_merged_{members[0]}"
+
+            # If a final file already exists, just mark the group as merged.
+            existing = file_query.get_file_by_dataset_and_name(self.db_manager, dataset, target_name)
+            if existing and existing.get("encode") == "video-none":
+                try:
+                    merge_group_query.set_merged_file(self.db_manager, mg_id, existing.get("id"))
+                except Exception:
+                    pass
+                return True
+
+            # Resolve member file rows in declared order
+            rows = file_query.get_files_by_names(self.db_manager, dataset, members)
+            by_name = {str(r.get("name")): r for r in rows if r.get("key")}
+            ordered_rows = [by_name.get(str(n)) for n in members if by_name.get(str(n))]
+            if len(ordered_rows) != len(members):
+                # missing source files; try next group
+                continue
+
+            keys = [r["key"] for r in ordered_rows if r.get("key")]
+            work_dir = Path("work_merge") / (rid_leaf(mg_id) if mg_id else get_uuid(8))
+            merged_local = work_dir / target_name
+
+            try:
+                work_dir.mkdir(parents=True, exist_ok=True)
+                dl_results = self.uploader.download_files(keys=keys, dest_dir=work_dir)
+                key_to_local = {
+                    r.key: r.local_path for r in dl_results if r.status == S3Info.SUCCESS and r.local_path
+                }
+                if len(key_to_local) != len(keys):
+                    raise RuntimeError("One or more source videos failed to download")
+
+                ordered_paths = [key_to_local[k] for k in keys]
+                concat_videos(ordered_paths, str(merged_local))
+
+                # Upload merged video with dataset/<first_member_name>
+                target_key = f"{dataset}/{target_name}"
+                up = self.uploader.upload_file_as(str(merged_local), target_key)
+                if up.status != S3Info.SUCCESS:
+                    raise RuntimeError(f"Upload failed: {up.error}")
+
+                first_row = ordered_rows[0] if ordered_rows else None
+                if not first_row:
+                    raise RuntimeError("Missing first source row for merge group")
+
+                # Copy thumbnail with prefixed name (do not reference original)
+                new_thumb_key = None
+                first_thumb = first_row.get("thumbKey")
+                if first_thumb:
+                    thumb_suffix = Path(first_thumb).suffix or ".jpg"
+                    new_thumb_key = f"{dataset}/.thumbs/{Path(target_name).name}{thumb_suffix}"
+                    thumb_local = work_dir / Path(first_thumb).name
+                    dl_thumb = self.uploader.download_file(first_thumb, str(thumb_local))
+                    if dl_thumb.status == S3Info.SUCCESS and dl_thumb.local_path:
+                        up_thumb = self.uploader.upload_file_as(dl_thumb.local_path, new_thumb_key)
+                        if up_thumb.status != S3Info.SUCCESS:
+                            new_thumb_key = None
+                    else:
+                        new_thumb_key = None
+
+                merged_size = merged_local.stat().st_size
+                mime = first_row.get("mime") or mimetypes.guess_type(target_name)[0] or "video/mp4"
+                bucket = first_row.get("bucket") or self.uploader.bucket
+                ins = file_query.insert_file_record(
+                    self.db_manager,
+                    dataset=dataset,
+                    key=target_key,
+                    name=target_name,
+                    mime=mime,
+                    size=merged_size,
+                    bucket=bucket,
+                    encode="video-none",
+                    thumb_key=new_thumb_key,
+                    meta={
+                        "mergeGroup": mg_id,
+                        "members": members,
+                        "mode": mg.get("mode"),
+                    },
+                )
+                new_row = first_result(ins)
+                new_file_id = new_row.get("id") if isinstance(new_row, dict) else None
+                if new_file_id:
+                    merge_group_query.set_merged_file(self.db_manager, mg_id, new_file_id)
+                    merge_group_query.mark_merge_group_dead(self.db_manager, mg_id)
+                    for row in ordered_rows:
+                        fid = row.get("id")
+                        if fid:
+                            try:
+                                file_query.mark_file_dead(self.db_manager, fid)
+                            except Exception:
+                                pass
+                return True
+            except Exception as e:
+                print(f"Merge group {mg_id or dataset} failed: {e}")
+            finally:
+                try:
+                    if work_dir.exists():
+                        shutil.rmtree(work_dir, ignore_errors=True)
+                except Exception:
+                    pass
+
+        return False
 
     def run(self):
         while True:

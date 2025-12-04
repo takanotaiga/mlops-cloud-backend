@@ -1,4 +1,5 @@
 from backend_module.database import DataBaseManager
+from query.utils import extract_results
 
 
 def insert_hls_segment(
@@ -48,3 +49,17 @@ def get_segments_with_file_by_keys(db_manager: DataBaseManager, keys: list[str])
         """,
         {"KEYS": keys},
     )
+
+
+def list_segments_for_file(db_manager: DataBaseManager, file_id: str):
+    """Return ordered HLS segment rows (including init) for a file."""
+    res = db_manager.query(
+        """
+        SELECT key, bucket, meta, meta.index AS idx
+        FROM hls_segment
+        WHERE file = <record> $FILE
+        ORDER BY idx ASC;
+        """,
+        {"FILE": file_id},
+    )
+    return extract_results(res)

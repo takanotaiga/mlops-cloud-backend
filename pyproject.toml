@@ -1,6 +1,6 @@
 [project]
 name = "mlops-cloud-backend"
-version = "1.6.0"
+version = "1.6.1"
 description = "MLOps Cloud Backend"
 readme = "README.md"
 requires-python = ">=3.11, <3.12"

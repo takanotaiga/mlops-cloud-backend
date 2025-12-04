@@ -154,6 +154,41 @@ def encode_to_hls(
     return {"playlist": str(Path(playlist_path).resolve()), "segments": segs, "out_dir": str(out_dir_path.resolve())}
 
 
+def hls_to_mp4(playlist_path: str, output_path: str) -> str:
+    """
+    Repackage an HLS playlist (fMP4 segments) into a single MP4 using stream copy.
+
+    - Does not re-encode; uses `-c copy`.
+    - Assumes playlist and segments are locally accessible.
+    """
+    playlist = Path(playlist_path)
+    if not playlist.exists():
+        raise FileNotFoundError(f"HLS playlist not found: {playlist}")
+
+    out = Path(output_path)
+    if out.parent:
+        out.parent.mkdir(parents=True, exist_ok=True)
+
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-nostdin",
+        "-allowed_extensions",
+        "ALL",
+        "-i",
+        str(playlist),
+        "-c",
+        "copy",
+        "-movflags",
+        "+faststart",
+        str(out),
+    ]
+    rc, out_log = _run_with_executor(cmd)
+    if rc != 0 or not out.exists():
+        raise EncodeError("ffmpeg HLS->MP4 repack failed\n" + ((out_log or "")[-300:] if out_log else ""))
+    return str(out.resolve())
+
+
 def probe_video(path: str) -> dict:
     """ffprobeで動画情報を取得し、必要メタを返す。"""
     cmd = [
