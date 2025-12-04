@@ -7,7 +7,7 @@ from typing import Optional
 
 import paramiko
 import websockets
-from websockets.server import WebSocketServerProtocol
+from websockets.legacy.server import WebSocketServerProtocol
 
 
 # Websocket bind settings
@@ -68,16 +68,27 @@ async def _pump_pty_output(session: TerminalSession, websocket: WebSocketServerP
             data = await loop.run_in_executor(None, chan.recv, 1024)
             if not data:
                 break
-            await websocket.send(
-                json.dumps({"type": "output", "sessionId": session.session_id, "data": data.decode(errors="ignore")})
-            )
+            try:
+                await websocket.send(
+                    json.dumps(
+                        {"type": "output", "sessionId": session.session_id, "data": data.decode(errors="ignore")}
+                    )
+                )
+            except websockets.exceptions.ConnectionClosed:
+                break
     finally:
         try:
             exit_code = chan.recv_exit_status()
         except Exception:
             exit_code = None
-        await websocket.send(json.dumps({"type": "exit", "sessionId": session.session_id, "code": exit_code}))
-        await websocket.close()
+        try:
+            await websocket.send(json.dumps({"type": "exit", "sessionId": session.session_id, "code": exit_code}))
+        except websockets.exceptions.ConnectionClosed:
+            pass
+        try:
+            await websocket.close()
+        except websockets.exceptions.ConnectionClosed:
+            pass
 
 
 async def _handle_client_messages(session: TerminalSession, websocket: WebSocketServerProtocol) -> None:
