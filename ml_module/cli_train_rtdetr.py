@@ -18,6 +18,8 @@ def train_rtdetr(
     *,
     epochs: int = 1,
     base_model: str = "rtdetr-l.pt",
+    imgsz: int = 640,
+    pretrained: bool = True,
 ) -> Dict[str, Any]:
     dataset_dir = Path(dataset_dir)
     out_dir = Path(out_dir)
@@ -27,17 +29,16 @@ def train_rtdetr(
     if not data_yaml.is_file():
         raise FileNotFoundError(f"'data.yaml' is not found: {data_yaml}")
 
-    model_ref = base_model[:-3] + ".yaml" if base_model.endswith(".pt") else base_model
-    model = RTDETR(str(model_ref))
+    model = RTDETR(str(base_model))
 
     model.train(
         data=str(data_yaml),
         epochs=epochs,
-        imgsz=640,
+        imgsz=imgsz,
         name="train_result",
         project=str(out_dir),
         exist_ok=True,
-        pretrained=False,
+        pretrained=pretrained,
         batch=-1,  # auto-batch
     )
 
@@ -56,6 +57,8 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     ap.add_argument("--out-dir", required=True, help="学習成果物の出力ディレクトリ")
     ap.add_argument("--epochs", type=int, default=1)
     ap.add_argument("--base-model", default="rtdetr-l.pt")
+    ap.add_argument("--imgsz", type=int, default=640)
+    ap.add_argument("--pretrained", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--result", required=True, help="結果JSONの出力パス")
     return ap.parse_args(argv)
 
@@ -68,6 +71,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         out_dir=args.out_dir,
         epochs=args.epochs,
         base_model=args.base_model,
+        imgsz=args.imgsz,
+        pretrained=args.pretrained,
     )
 
     result_path = Path(args.result)
