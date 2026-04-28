@@ -587,6 +587,10 @@ class SamuraiULRModel:
             raise RuntimeError("RT-DETR training did not produce weights.")
 
         rtdetr_export_trt = os.getenv("RTDETR_EXPORT_TRT", "0").lower() not in {"0", "false", "no", "off"}
+        rtdetr_trt_precision = os.getenv("RTDETR_TRT_PRECISION", "fp16").lower()
+        rtdetr_trt_batch = int(os.getenv("RTDETR_TRT_BATCH", "1"))
+        rtdetr_trt_fraction = float(os.getenv("RTDETR_TRT_FRACTION", "1.0"))
+        rtdetr_trt_dynamic = os.getenv("RTDETR_TRT_DYNAMIC", "0").lower() not in {"0", "false", "no", "off"}
         try:
             model_engine = None
             if model_pt and rtdetr_export_trt:
@@ -615,11 +619,19 @@ class SamuraiULRModel:
                     # Perform export only if not already resolved
                     if not model_engine:
                         start_step("trt_export")
-                        rc2 = cmd_exec([
+                        export_cmd = [
                             "uv", "run", "-m", "ml_module.cli_export_trt",
                             "--weights", str(model_pt),
+                            "--precision", rtdetr_trt_precision,
+                            "--batch", str(rtdetr_trt_batch),
+                            "--fraction", str(rtdetr_trt_fraction),
                             "--result", str(export_json),
-                        ])
+                        ]
+                        if rtdetr_trt_dynamic:
+                            export_cmd.append("--dynamic")
+                        if rtdetr_trt_precision == "int8":
+                            export_cmd.extend(["--data", str(dataset_root / "data.yaml")])
+                        rc2 = cmd_exec(export_cmd)
                         print(f"[samurai] job={job_id} trt_export rc={rc2} result={export_json}")
                         if rc2 == 0 and export_json.exists():
                             try:
