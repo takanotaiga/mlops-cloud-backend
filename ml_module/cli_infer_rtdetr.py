@@ -10,7 +10,7 @@ import pandas as pd
 
 
 def run_inference(model_path: str, video_path: str, *, out_parquet: str, out_video: str | None = None,
-                  conf: float = 0.25, imgsz: int = 640) -> Dict[str, Any]:
+                  conf: float = 0.25, imgsz: int = 640, half: bool = False) -> Dict[str, Any]:
     from ultralytics import RTDETR
 
     cap = cv2.VideoCapture(video_path)
@@ -28,7 +28,7 @@ def run_inference(model_path: str, video_path: str, *, out_parquet: str, out_vid
 
     rows: List[Dict[str, Any]] = []
     frame_idx = -1
-    for results in model.predict(video_path, stream=True, verbose=True, conf=conf, imgsz=imgsz):
+    for results in model.predict(video_path, stream=True, verbose=True, conf=conf, imgsz=imgsz, half=half):
         frame_idx += 1
         names = results.names if hasattr(results, "names") else {}
         # boxes.xywh, boxes.cls
@@ -87,11 +87,12 @@ def main() -> int:
     ap.add_argument("--out-video", default=None, help="Optional output overlay mp4 path")
     ap.add_argument("--conf", type=float, default=0.25)
     ap.add_argument("--imgsz", type=int, default=640)
+    ap.add_argument("--half", action="store_true", help="Run PyTorch inference with FP16 where supported")
     ap.add_argument("--result", required=True, help="Path to write JSON result")
     args = ap.parse_args()
 
     res = run_inference(args.model, args.video, out_parquet=args.out_parquet, out_video=args.out_video,
-                        conf=args.conf, imgsz=args.imgsz)
+                        conf=args.conf, imgsz=args.imgsz, half=args.half)
     Path(args.result).parent.mkdir(parents=True, exist_ok=True)
     with open(args.result, "w", encoding="utf-8") as f:
         json.dump(res, f, ensure_ascii=False, indent=2)
@@ -100,4 +101,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

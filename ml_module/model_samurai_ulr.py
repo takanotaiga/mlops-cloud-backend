@@ -7,6 +7,7 @@ from typing import List, Optional, Dict, Tuple, Any
 import cv2
 import pandas as pd
 from threading import Lock
+from query.utils import first_result
 
 
 @dataclass
@@ -23,9 +24,55 @@ def _ensure_dir(p: str):
 
 
 # Cache for TensorRT exports to avoid repeated conversions per weights path
-# key: path to .pt weights, value: path to exported engine (or None if failed)
+# key: path + export options, value: path to exported engine (or None if failed)
 _TRT_EXPORT_CACHE: dict[str, Optional[str]] = {}
 _TRT_EXPORT_LOCK = Lock()
+
+
+INFERENCE_BACKEND_TENSORRT_FP16 = "tensorrt-fp16"
+INFERENCE_BACKEND_PYTORCH_FP32 = "pytorch-fp32"
+INFERENCE_BACKEND_PYTORCH_FP16 = "pytorch-fp16"
+INFERENCE_BACKENDS = {
+    INFERENCE_BACKEND_TENSORRT_FP16,
+    INFERENCE_BACKEND_PYTORCH_FP32,
+    INFERENCE_BACKEND_PYTORCH_FP16,
+}
+DEFAULT_RTDETR_EPOCHS = 4
+
+
+def _get_inference_backend(db_manager, job_id: str) -> str:
+    """Return the per-job inference backend, defaulting to legacy TensorRT FP16."""
+    try:
+        payload = db_manager.query(
+            "SELECT VALUE inferenceBackend FROM inference_job WHERE id = <record> $JOB_ID LIMIT 1",
+            {"JOB_ID": job_id},
+        )
+        value = first_result(payload)
+        backend = str(value or INFERENCE_BACKEND_TENSORRT_FP16)
+    except Exception:
+        backend = INFERENCE_BACKEND_TENSORRT_FP16
+
+    if backend not in INFERENCE_BACKENDS:
+        raise ValueError(f"Unsupported SAMURAI ULR inferenceBackend: {backend}")
+    return backend
+
+
+def _get_rtdetr_epochs(db_manager, job_id: str) -> int:
+    """Return the per-job RT-DETR training epoch count."""
+    default_epochs = int(os.getenv("RTDETR_EPOCHS", str(DEFAULT_RTDETR_EPOCHS)))
+    try:
+        payload = db_manager.query(
+            "SELECT VALUE rtdetrEpochs FROM inference_job WHERE id = <record> $JOB_ID LIMIT 1",
+            {"JOB_ID": job_id},
+        )
+        value = first_result(payload)
+        epochs = default_epochs if value in (None, "") else int(value)
+    except Exception:
+        epochs = default_epochs
+
+    if epochs < 1:
+        raise ValueError(f"rtdetrEpochs must be >= 1: {epochs}")
+    return epochs
 
 
 def _get_total_frame_count(video_path: str) -> int:
@@ -214,6 +261,8 @@ class SamuraiULRModel:
     def process_group(self, db_manager, job_id: str, file_group: List[Dict[str, Any]], work_dir: str) -> Dict[str, Any]:
         work = Path(work_dir)
         work.mkdir(parents=True, exist_ok=True)
+        inference_backend = _get_inference_backend(db_manager, str(job_id))
+        print(f"[samurai] job={job_id} inference_backend={inference_backend}")
 
         results_artifacts: List[Dict[str, str]] = []
         temp_datasets: List[str] = []
@@ -553,7 +602,7 @@ class SamuraiULRModel:
         start_step("rtdetr_train")
         train_out = Path(work) / f"train_result_{Path(str(fid)).name}"
         train_json = Path(work) / f"train_result_{Path(str(fid)).name}.json"
-        rtdetr_epochs = int(os.getenv("RTDETR_EPOCHS", "12"))
+        rtdetr_epochs = _get_rtdetr_epochs(db_manager, str(job_id))
         rtdetr_base_model = os.getenv("RTDETR_BASE_MODEL", "rtdetr-l.pt")
         rtdetr_imgsz = int(os.getenv("RTDETR_IMGSZ", "640"))
         rtdetr_pretrained = os.getenv("RTDETR_PRETRAINED", "1").lower() not in {"0", "false", "no", "off"}
@@ -586,8 +635,8 @@ class SamuraiULRModel:
             fail_step("rtdetr_train")
             raise RuntimeError("RT-DETR training did not produce weights.")
 
-        rtdetr_export_trt = os.getenv("RTDETR_EXPORT_TRT", "0").lower() not in {"0", "false", "no", "off"}
-        rtdetr_trt_precision = os.getenv("RTDETR_TRT_PRECISION", "fp16").lower()
+        rtdetr_export_trt = inference_backend == INFERENCE_BACKEND_TENSORRT_FP16
+        rtdetr_trt_precision = "fp16"
         rtdetr_trt_batch = int(os.getenv("RTDETR_TRT_BATCH", "1"))
         rtdetr_trt_fraction = float(os.getenv("RTDETR_TRT_FRACTION", "1.0"))
         rtdetr_trt_dynamic = os.getenv("RTDETR_TRT_DYNAMIC", "0").lower() not in {"0", "false", "no", "off"}
@@ -595,8 +644,9 @@ class SamuraiULRModel:
             model_engine = None
             if model_pt and rtdetr_export_trt:
                 # Check global cache to ensure we export TensorRT at most once per weights
+                cache_key = f"{model_pt}|precision={rtdetr_trt_precision}|batch={rtdetr_trt_batch}|fraction={rtdetr_trt_fraction}|dynamic={int(rtdetr_trt_dynamic)}"
                 with _TRT_EXPORT_LOCK:
-                    cached = _TRT_EXPORT_CACHE.get(str(model_pt))
+                    cached = _TRT_EXPORT_CACHE.get(cache_key)
                 if cached is not None:
                     model_engine = cached
                     # Even if cached, reflect that export is effectively complete
@@ -646,11 +696,11 @@ class SamuraiULRModel:
                             raise RuntimeError("TensorRT export failed.")
                     # Update cache with result (including None to avoid repeated attempts)
                     with _TRT_EXPORT_LOCK:
-                        _TRT_EXPORT_CACHE[str(model_pt)] = model_engine
+                        _TRT_EXPORT_CACHE[cache_key] = model_engine
             elif model_pt:
                 start_step("trt_export")
                 complete_step("trt_export")
-                print(f"[samurai] job={job_id} trt_export skipped; using PyTorch weights")
+                print(f"[samurai] job={job_id} trt_export skipped; using {inference_backend} weights")
 
             # Pick an inference model path preference: engine > pt
             model_path = model_engine or model_pt
@@ -682,7 +732,7 @@ class SamuraiULRModel:
             out_video = str(work / "group_infer.mp4")
             out_json = str(work / "group_infer.json")
             rtdetr_infer_conf = float(os.getenv("RTDETR_INFER_CONF", "0.25"))
-            rc = cmd_exec([
+            infer_cmd = [
                 "uv", "run", "-m", "ml_module.cli_infer_rtdetr",
                 "--model", str(global_model_path),
                 "--video", str(infer_input),
@@ -690,7 +740,10 @@ class SamuraiULRModel:
                 "--out-video", out_video,
                 "--conf", str(rtdetr_infer_conf),
                 "--result", out_json,
-            ])
+            ]
+            if inference_backend == INFERENCE_BACKEND_PYTORCH_FP16:
+                infer_cmd.append("--half")
+            rc = cmd_exec(infer_cmd)
             print(f"[samurai] job={job_id} rtdetr_infer rc={rc} input={infer_input}")
             if rc != 0 or not os.path.exists(out_parquet):
                 fail_step("rtdetr_infer")
