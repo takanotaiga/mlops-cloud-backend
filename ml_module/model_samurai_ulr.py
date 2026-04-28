@@ -553,13 +553,19 @@ class SamuraiULRModel:
         start_step("rtdetr_train")
         train_out = Path(work) / f"train_result_{Path(str(fid)).name}"
         train_json = Path(work) / f"train_result_{Path(str(fid)).name}.json"
+        rtdetr_epochs = int(os.getenv("RTDETR_EPOCHS", "12"))
+        rtdetr_base_model = os.getenv("RTDETR_BASE_MODEL", "rtdetr-l.pt")
+        rtdetr_imgsz = int(os.getenv("RTDETR_IMGSZ", "640"))
+        rtdetr_pretrained = os.getenv("RTDETR_PRETRAINED", "1").lower() not in {"0", "false", "no", "off"}
         rc = cmd_exec([
             "uv", "run", "-m", "ml_module.cli_train_rtdetr",
             # Pass absolute path under /workspace/src/datasets
             "--dataset", str(dataset_root),
             "--out-dir", str(train_out),
-            "--epochs", str(4),
-            "--base-model", "rtdetr-l.pt",
+            "--epochs", str(rtdetr_epochs),
+            "--base-model", rtdetr_base_model,
+            "--imgsz", str(rtdetr_imgsz),
+            "--pretrained" if rtdetr_pretrained else "--no-pretrained",
             "--result", str(train_json),
         ])
         print(f"[samurai] job={job_id} train rc={rc} out={train_json}")
@@ -580,9 +586,10 @@ class SamuraiULRModel:
             fail_step("rtdetr_train")
             raise RuntimeError("RT-DETR training did not produce weights.")
 
+        rtdetr_export_trt = os.getenv("RTDETR_EXPORT_TRT", "0").lower() not in {"0", "false", "no", "off"}
         try:
             model_engine = None
-            if model_pt:
+            if model_pt and rtdetr_export_trt:
                 # Check global cache to ensure we export TensorRT at most once per weights
                 with _TRT_EXPORT_LOCK:
                     cached = _TRT_EXPORT_CACHE.get(str(model_pt))
@@ -628,6 +635,10 @@ class SamuraiULRModel:
                     # Update cache with result (including None to avoid repeated attempts)
                     with _TRT_EXPORT_LOCK:
                         _TRT_EXPORT_CACHE[str(model_pt)] = model_engine
+            elif model_pt:
+                start_step("trt_export")
+                complete_step("trt_export")
+                print(f"[samurai] job={job_id} trt_export skipped; using PyTorch weights")
 
             # Pick an inference model path preference: engine > pt
             model_path = model_engine or model_pt
@@ -658,12 +669,14 @@ class SamuraiULRModel:
             out_parquet = str(work / "group_infer.parquet")
             out_video = str(work / "group_infer.mp4")
             out_json = str(work / "group_infer.json")
+            rtdetr_infer_conf = float(os.getenv("RTDETR_INFER_CONF", "0.25"))
             rc = cmd_exec([
                 "uv", "run", "-m", "ml_module.cli_infer_rtdetr",
                 "--model", str(global_model_path),
                 "--video", str(infer_input),
                 "--out-parquet", out_parquet,
                 "--out-video", out_video,
+                "--conf", str(rtdetr_infer_conf),
                 "--result", out_json,
             ])
             print(f"[samurai] job={job_id} rtdetr_infer rc={rc} input={infer_input}")
