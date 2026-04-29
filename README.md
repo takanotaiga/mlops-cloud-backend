@@ -12,7 +12,6 @@ This repo does not expose the primary product API. Workers communicate with the 
 | Inference | `uv run ml_inference_manager.py` | run SAMURAI/SAM2/RT-DETR inference jobs |
 | Cleaner | `uv run cleaner_manager.py` | remove `dead=true` files and orphan records from DB/S3 |
 | Hardware metrics | `uv run hardware_metrics_manager.py` | collect metrics |
-| Terminal | `uv run terminal_manager.py` | WebSocket terminal bridge |
 
 ## Install
 
@@ -131,5 +130,5 @@ docker compose -f e2e/compose.phase4.yml down -v
 
 - `Faild` and `StopInterrept` are existing status values. Preserve compatibility.
 - Cleaner deletes DB/S3 asynchronously after UI soft delete.
-- `terminal_manager.py` is sensitive because it can connect to host SSH. Do not expose it publicly without authentication and network controls.
+- The former WebSocket terminal bridge was removed because it exposed host SSH access from the application surface.
 - Do not commit real credentials.

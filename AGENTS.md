@@ -10,7 +10,6 @@
 | `ml_inference_manager.py` | `inference_job` を処理し SAMURAI/SAM2/RT-DETR pipeline を実行 |
 | `cleaner_manager.py` | `dead=true` file や orphan annotation を DB/S3 から削除 |
 | `hardware_metrics_manager.py` | hardware metrics を収集 |
-| `terminal_manager.py` | WebSocket terminal bridge |
 | `system_manager.py` | host/system helper |
 
 ## 主要 module
@@ -94,7 +93,7 @@ Phase4 requires NVIDIA container runtime and can take minutes.
 ## Security / operations
 
 - Do not hardcode real credentials.
-- `terminal_manager.py` can bridge to host SSH. Treat it as sensitive and avoid exposing it without auth/network controls.
+- The WebSocket terminal bridge was removed because host SSH access should not be exposed from the product UI.
 - Cleanup is asynchronous. UI deletes usually mark records `dead=true`; backend cleaner removes DB/S3 later.
 - Work directories must be job-scoped and cleaned on failure.
 - HLS output should register playlist/segments in DB and upload all referenced objects to S3.
