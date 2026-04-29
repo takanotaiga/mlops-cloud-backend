@@ -10,6 +10,7 @@ from backend_module.config import load_surreal_config, load_s3_config
 from backend_module.uuid_tools import get_uuid
 from query import ml_inference_job_query
 from query.utils import extract_results, first_result
+from backend_module.job_log import capture_job_logs
 from backend_module.progress_tracker import InferenceJobProgressTracker
 
 
@@ -184,7 +185,10 @@ class MLInferenceRunner:
             work_dir = Path("work_infer") / get_uuid(16)
             tracker: Optional[InferenceJobProgressTracker] = None
             temp_datasets_to_cleanup: set[str] = set()
+            log_capture = capture_job_logs(self.db_manager, job_id=str(job_id), source="mlx", archive_uploader=self.uploader)
+            log_capture.__enter__()
             try:
+                print(f"[mlx] job={job_id} started task_type={task_type} model={model}")
                 # Initialize progress tracker and default steps
                 tracker = InferenceJobProgressTracker(self.db_manager, str(job_id))
                 tracker.init_default_steps()
@@ -289,6 +293,7 @@ class MLInferenceRunner:
 
                 # 4) Mark job completed
                 ml_inference_job_query.set_inference_job_status(self.db_manager, job_id, "Completed")
+                print(f"[mlx] job={job_id} completed")
                 return
 
 
@@ -313,6 +318,7 @@ class MLInferenceRunner:
                             shutil.rmtree(d, ignore_errors=True)
                 except Exception:
                     pass
+                log_capture.__exit__(None, None, None)
 
         if jobs:
             with ThreadPoolExecutor(max_workers=1) as ex:
