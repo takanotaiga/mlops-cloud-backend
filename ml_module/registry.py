@@ -14,6 +14,9 @@ def get_model(model: Optional[str], model_source: Optional[str], task_type: Opti
     if model == "samurai-ulr" and model_source == "internet" and task_type == "one-shot-object-detection":
         from .model_samurai_ulr import SamuraiULRModel  # lazy import
         return SamuraiULRModel()
+    if model == "t260-ulr" and model_source == "internet" and task_type == "one-shot-object-detection":
+        from .model_t260_ulr import T260ULRModel  # lazy import
+        return T260ULRModel()
     return None
 
 
@@ -45,6 +48,8 @@ def run_inference_task(
         print(dbg)
         if model == "samurai-ulr":
             print("Select Model: SAMURAI Ultra Long Range")
+        elif model == "t260-ulr":
+            print("Select Model: T260 Ultra Long Range")
     else:
         print("[ERROR]", task_type, "is unknown task type.")
         return None

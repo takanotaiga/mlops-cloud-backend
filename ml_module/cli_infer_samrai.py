@@ -31,8 +31,12 @@ def _list_image_files(d: str) -> List[Path]:
 
 
 def _build_sam2_predictor():
-    # sam2 の import 経路
-    sam2_repo = os.environ.get("SAM2_REPO_DIR", "/workspace/samurai/sam2")
+    # Keep the legacy SAMURAI checkout path as an optional fallback, but prefer
+    # the uv-installed official SAM2 package.
+    sam2_repo = os.environ.get("SAM2_REPO_DIR")
+    legacy_sam2_repo = "/workspace/samurai/sam2"
+    if not sam2_repo and Path(legacy_sam2_repo).exists():
+        sam2_repo = legacy_sam2_repo
     if sam2_repo and sam2_repo not in sys.path:
         sys.path.append(sam2_repo)
 
@@ -40,11 +44,11 @@ def _build_sam2_predictor():
 
     ckpt = os.environ.get(
         "SAM2_CHECKPOINT",
-        "/workspace/samurai/sam2/checkpoints/sam2.1_hiera_base_plus.pt",
+        "/workspace/models/sam2/sam2.1_hiera_base_plus.pt",
     )
     cfg = os.environ.get(
         "SAM2_CONFIG",
-        "configs/samurai/sam2.1_hiera_b+.yaml",
+        "configs/sam2.1/sam2.1_hiera_b+.yaml",
     )
 
     device = "cuda:0" if torch.cuda.is_available() else "cpu"

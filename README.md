@@ -80,9 +80,11 @@ Legacy `SURREAL_ENDPOINT` / `S3_ENDPOINT` style variables are fallback only.
 Current supported UI path:
 
 - `taskType=one-shot-object-detection`
-- `model=samurai-ulr`
+- `model=samurai-ulr` or `model=t260-ulr`
 - one dataset containing exactly one video
 - one-shot SAM2 bbox annotation as seed
+
+`t260-ulr` uses the official SAM2.1 package for tracking and RF-DETR for detector fine-tuning/inference. RF-DETR TensorRT export is not enabled yet; T260 defaults to PyTorch FP16.
 
 Runtime options:
 

@@ -60,12 +60,12 @@ WORKDIR /workspace/src
 
 COPY pyproject.toml /workspace/src
 COPY uv.lock /workspace/src
+ENV SAM2_BUILD_CUDA=0
 RUN uv sync --extra=mlx
 
-RUN git clone -b master --single-branch --depth=1 https://github.com/moriyalab/samurai.git /workspace/samurai && \
-    cd /workspace/samurai/sam2/checkpoints && \
-    ./download_ckpts.sh && \
-    cd ..
+RUN mkdir -p /workspace/models/sam2 && \
+    wget -O /workspace/models/sam2/sam2.1_hiera_base_plus.pt \
+      https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_base_plus.pt
 
 COPY ml_module /workspace/src/ml_module
 COPY backend_module /workspace/src/backend_module
