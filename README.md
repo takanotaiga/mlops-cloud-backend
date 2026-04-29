@@ -1,130 +1,135 @@
 # mlops-cloud-backend
 
-このリポジトリにはエンコード実行ワーカー（`video_manager.py`）と推論実行ワーカー（`ml_inference_manager.py`）が含まれます。どちらも SurrealDB と MinIO/S3 の接続情報を環境変数から読み込みます。
+Python worker repository for MLOps Cloud.
 
-以下に Docker 単体実行（docker run）と docker compose のサンプルを示します。
+This repo does not expose the primary product API. Workers communicate with the UI through shared SurrealDB records and MinIO/S3 objects.
 
-## Docker Run（単体実行）
+## Workers
 
-先にイメージをビルドします。
+| Worker | Command | Purpose |
+|---|---|---|
+| Video / CV | `uv run video_manager.py` | encode uploaded videos and inference result videos to HLS |
+| Inference | `uv run ml_inference_manager.py` | run SAMURAI/SAM2/RT-DETR inference jobs |
+| Cleaner | `uv run cleaner_manager.py` | remove `dead=true` files and orphan records from DB/S3 |
+| Hardware metrics | `uv run hardware_metrics_manager.py` | collect metrics |
+| Terminal | `uv run terminal_manager.py` | WebSocket terminal bridge |
 
-- エンコードワーカー（FFmpeg 含む）
-  - `docker build -f Dockerfile.cv -t mlops-video .`
-- 推論ワーカー（CUDA/CuDNN 前提）
-  - `docker build -f Dockerfile.mlx -t mlops-ml .`
+## Install
 
-実行例（各種環境変数は適宜変更してください）。
-
-- エンコードワーカー（CPU/GPU どちらでも可）
-  - `docker run --rm \
-      -e SURREAL_URL=ws://database:8000/rpc \
-      -e SURREAL_NS=mlops \
-      -e SURREAL_DB=cloud_ui \
-      -e SURREAL_USER=root \
-      -e SURREAL_PASS=root \
-      -e MINIO_ENDPOINT_INTERNAL=http://object-storage:9000 \
-      -e MINIO_REGION=us-east-1 \
-      -e MINIO_ACCESS_KEY_ID=minioadmin \
-      -e MINIO_SECRET_ACCESS_KEY=minioadmin \
-      -e MINIO_BUCKET=mlops-datasets \
-      -e MINIO_FORCE_PATH_STYLE=true \
-      -e S3_MULTIPART_THRESHOLD_BYTES=1000000000 \
-      --name mlops-video mlops-video`
-
-- 推論ワーカー（GPU 利用）
-  - `docker run --rm --gpus all \
-      -e SURREAL_URL=ws://database:8000/rpc \
-      -e SURREAL_NS=mlops \
-      -e SURREAL_DB=cloud_ui \
-      -e SURREAL_USER=root \
-      -e SURREAL_PASS=root \
-      -e MINIO_ENDPOINT_INTERNAL=http://object-storage:9000 \
-      -e MINIO_REGION=us-east-1 \
-      -e MINIO_ACCESS_KEY_ID=minioadmin \
-      -e MINIO_SECRET_ACCESS_KEY=minioadmin \
-      -e MINIO_BUCKET=mlops-datasets \
-      -e MINIO_FORCE_PATH_STYLE=true \
-      -e S3_MULTIPART_THRESHOLD_BYTES=1000000000 \
-      --name mlops-ml mlops-ml`
-
-## docker compose（例）
-
-最小構成の例です。SurrealDB と MinIO、バックエンドワーカー2種を同時に起動します。
-
-```yaml
-version: "3.9"
-services:
-  database:
-    image: surrealdb/surrealdb:latest
-    command: ["start", "--log", "info", "-A", "--user", "root", "--pass", "root", "memory"]
-    ports:
-      - "8000:8000"
-    restart: unless-stopped
-
-  object-storage:
-    image: minio/minio:latest
-    command: server /data --console-address ":9001"
-    environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
-    ports:
-      - "9000:9000"  # S3 API
-      - "9001:9001"  # Console UI
-    volumes:
-      - minio-data:/data
-    restart: unless-stopped
-
-  mlops-video:
-    image: mlops-video  # 事前に `docker build -f Dockerfile.cv -t mlops-video .`
-    depends_on:
-      - database
-      - object-storage
-    environment:
-      SURREAL_URL: ws://database:8000/rpc
-      SURREAL_NS: mlops
-      SURREAL_DB: cloud_ui
-      SURREAL_USER: root
-      SURREAL_PASS: root
-      MINIO_ENDPOINT_INTERNAL: http://object-storage:9000
-      MINIO_REGION: us-east-1
-      MINIO_ACCESS_KEY_ID: minioadmin
-      MINIO_SECRET_ACCESS_KEY: minioadmin
-      MINIO_BUCKET: mlops-datasets
-      MINIO_FORCE_PATH_STYLE: "true"
-      S3_MULTIPART_THRESHOLD_BYTES: "1000000000"
-    restart: unless-stopped
-
-  mlops-ml:
-    image: mlops-ml  # 事前に `docker build -f Dockerfile.mlx -t mlops-ml .`
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - capabilities: ["gpu"]
-    depends_on:
-      - database
-      - object-storage
-    environment:
-      SURREAL_URL: ws://database:8000/rpc
-      SURREAL_NS: mlops
-      SURREAL_DB: cloud_ui
-      SURREAL_USER: root
-      SURREAL_PASS: root
-      MINIO_ENDPOINT_INTERNAL: http://object-storage:9000
-      MINIO_REGION: us-east-1
-      MINIO_ACCESS_KEY_ID: minioadmin
-      MINIO_SECRET_ACCESS_KEY: minioadmin
-      MINIO_BUCKET: mlops-datasets
-      MINIO_FORCE_PATH_STYLE: "true"
-      S3_MULTIPART_THRESHOLD_BYTES: "1000000000"
-      POLL_INTERVAL: "5"
-    restart: unless-stopped
-
-volumes:
-  minio-data:
+```bash
+uv sync
 ```
 
-補足
-- それぞれのサービスは環境変数から設定を読み込みます（`backend_module/config.py`）。
-- UI と併用する場合は、UI 側の compose に合わせて同じ Surreal/MinIO のエンドポイントを指定してください。
-- 推論側は GPU を使う前提のイメージです。環境により `--gpus all`（docker run）や `deploy.resources.reservations.devices`（compose）の指定を調整してください。
+GPU / inference dependencies:
+
+```bash
+uv sync --extra mlx
+```
+
+Python requirement: `>=3.11,<3.12`.
+
+## Docker
+
+Build base image:
+
+```bash
+docker build -f Dockerfile.base -t mlops-cloud-backend-base:dev .
+```
+
+Build GPU image:
+
+```bash
+docker build -f Dockerfile.gpu -t mlops-cloud-backend-gpu:dev .
+```
+
+Run GPU check:
+
+```bash
+docker run --rm --gpus all mlops-cloud-backend-gpu:dev nvidia-smi
+```
+
+Older names like `Dockerfile.cv` and `Dockerfile.mlx` are obsolete.
+
+## Configuration
+
+Preferred SurrealDB env:
+
+```bash
+SURREAL_URL=ws://database:8000/rpc
+SURREAL_NS=mlops
+SURREAL_DB=cloud_ui
+SURREAL_USER=root
+SURREAL_PASS=root
+```
+
+Preferred MinIO/S3 env:
+
+```bash
+MINIO_ENDPOINT_INTERNAL=http://object-storage:9000
+MINIO_REGION=us-east-1
+MINIO_ACCESS_KEY_ID=minioadmin
+MINIO_SECRET_ACCESS_KEY=minioadmin
+MINIO_BUCKET=mlops-datasets
+MINIO_FORCE_PATH_STYLE=true
+S3_MULTIPART_THRESHOLD_BYTES=1000000000
+```
+
+Legacy `SURREAL_ENDPOINT` / `S3_ENDPOINT` style variables are fallback only.
+
+## Inference Notes
+
+Current supported UI path:
+
+- `taskType=one-shot-object-detection`
+- `model=samurai-ulr`
+- one dataset containing exactly one video
+- one-shot SAM2 bbox annotation as seed
+
+Runtime options:
+
+- `inferenceBackend=tensorrt-fp16` (default for compatibility)
+- `inferenceBackend=pytorch-fp16`
+- `inferenceBackend=pytorch-fp32`
+- `rtdetrEpochs` defaults to 4
+
+TensorRT behavior can depend on GPU generation, CUDA, TensorRT and exported ONNX shape/options. Keep PyTorch fallback paths healthy and test with Phase4 when changing this area.
+
+## HLS Notes
+
+`video_manager.py` is responsible for HLS encoding both uploaded dataset videos and inference result videos. UI video preview expects HLS playlist records:
+
+- `hls_playlist`
+- `hls_segment`
+
+The UI HLS route rewrites playlist segment URLs through `/api/storage/object`.
+
+## Tests
+
+Unit tests:
+
+```bash
+uv run pytest -q
+```
+
+Integration tests from the compose repo:
+
+```bash
+cd ../mlops-cloud
+docker compose -f e2e/compose.phase2.yml up --build --abort-on-container-exit --exit-code-from backend-test backend-test
+docker compose -f e2e/compose.phase2.yml down -v
+```
+
+GPU E2E:
+
+```bash
+cd ../mlops-cloud
+docker compose -f e2e/compose.phase4.yml up --build --abort-on-container-exit --exit-code-from phase4-test phase4-test
+docker compose -f e2e/compose.phase4.yml down -v
+```
+
+## Operational Caveats
+
+- `Faild` and `StopInterrept` are existing status values. Preserve compatibility.
+- Cleaner deletes DB/S3 asynchronously after UI soft delete.
+- `terminal_manager.py` is sensitive because it can connect to host SSH. Do not expose it publicly without authentication and network controls.
+- Do not commit real credentials.

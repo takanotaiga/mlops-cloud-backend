@@ -1,122 +1,100 @@
-# Repository Guidelines
+# AGENTS.md
 
-## Project Structure & Module Organization
-- `backend_module/`: Core modules (e.g., `object_storage.py` for S3/MinIO I/O, `database.py`, `uuid_tools.py`).
-- `query/`: Query-related helpers and scripts.
-- `docker/`: Container assets (e.g., `Dockerfile.cv`).
-- Root scripts: `video_manager.py`, `test.py` for ad-hoc runs.
+このリポジトリは MLOps Cloud の Python worker 群です。単一 API サーバーではなく、SurrealDB をポーリングし、MinIO/S3 上の object を処理する常駐プロセス群です。
 
-## Build, Test, and Development Commands
-- Create venv: `python -m venv .venv && source .venv/bin/activate`.
-- Install deps (example): `pip install -U pip boto3`.
-- Run local script: `python test.py` (adjust as needed).
-- Lint/format (if installed): `ruff .` and `black .`.
-- Docker build (example): `docker build -f docker/Dockerfile.cv -t mlops-cv .`.
+## 主要 worker
 
-## Coding Style & Naming Conventions
-- Python 3.10+, 4-space indentation, type hints where practical.
-- Modules and functions: `snake_case`; classes: `PascalCase`.
-- Keep functions cohesive; prefer small, testable units.
-- Add docstrings for public methods (e.g., upload/download APIs in `object_storage.py`).
+| File | Role |
+|---|---|
+| `video_manager.py` | video / inference_result を HLS 化し `hls_*` records を作成 |
+| `ml_inference_manager.py` | `inference_job` を処理し SAMURAI/SAM2/RT-DETR pipeline を実行 |
+| `cleaner_manager.py` | `dead=true` file や orphan annotation を DB/S3 から削除 |
+| `hardware_metrics_manager.py` | hardware metrics を収集 |
+| `terminal_manager.py` | WebSocket terminal bridge |
+| `system_manager.py` | host/system helper |
 
-## Testing Guidelines
-- Prefer `pytest`; name tests `test_*.py`.
-- Place tests next to modules or under `tests/` mirroring package paths.
-- Run: `pytest -q` (if added). For quick checks: `python test.py`.
-- Aim for coverage on error paths (network failures, missing keys).
+## 主要 module
 
-## Commit & Pull Request Guidelines
-- Commits: clear, imperative subject (e.g., "Add streaming S3 downloader").
-- Reference issues in the body (e.g., `Fixes #123`).
-- PRs: include purpose, screenshots/logs if relevant, and steps to verify.
-- Keep diffs focused; update docs when behavior changes.
+| Path | Role |
+|---|---|
+| `backend_module/config.py` | env config loader |
+| `backend_module/database.py` | SurrealDB wrapper |
+| `backend_module/object_storage.py` | MinIO/S3 wrapper |
+| `backend_module/encoder.py` | FFmpeg/HLS helper |
+| `backend_module/progress_tracker.py` | inference progress update helper |
+| `query/` | table-specific query helpers |
+| `ml_module/` | SAMURAI/RT-DETR pipeline and CLI helpers |
 
-## Security & Configuration Tips
-- Do not hardcode secrets. Use environment variables for S3/MinIO:
-  `S3_ENDPOINT`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `S3_BUCKET`.
-- Use least-privilege credentials for buckets.
-- Large transfers: tune concurrency and thresholds in `MinioS3Uploader` as needed.
+## Environment
 
-## Architecture Overview
-- `backend_module/object_storage.py` centralizes S3/MinIO uploads and downloads.
-- Uses `boto3` TransferManager for multi-part, concurrent transfers to handle very large files efficiently.
+Python is pinned to `>=3.11,<3.12`. Use `uv`.
 
-## Code Walkthrough
+```bash
+uv sync
+uv sync --extra mlx
+```
 
-### Runtime Orchestrator
-- `video_manager.py`:
-  - Polls SurrealDB for queued HLS jobs every `interval` seconds via `TaskRunner`.
-  - For each job: download the source file from S3/MinIO, encode to HLS (playlist + init + fMP4 segments), upload assets, register playlist/segment metadata, then update job status.
-  - Runs jobs with GPU/CPU executors (1 each) and cleans up per-job work directories under `work/` regardless of success/failure.
+Preferred env names:
 
-### Storage Layer
-- `backend_module/object_storage.py`:
-  - `MinioS3Uploader`: thin wrapper around `boto3.client('s3')` configured for MinIO-compatible endpoints.
-  - Uploads: `upload_file()` and `upload_files()` with automatic multipart based on `TransferConfig` thresholds. Returns `UploadResult` with status in `S3Info`.
-  - Downloads: `download_file()` and `download_files()`; pre-checks existence with `head_object`; supports keeping S3 key path structure. Returns `DownloadResult` with `S3Info`.
-  - Content-Type inference via `mimetypes`; stable path-style addressing for MinIO.
+- `SURREAL_URL`, `SURREAL_NS`, `SURREAL_DB`, `SURREAL_USER`, `SURREAL_PASS`
+- `MINIO_ENDPOINT_INTERNAL`, `MINIO_REGION`, `MINIO_ACCESS_KEY_ID`, `MINIO_SECRET_ACCESS_KEY`, `MINIO_BUCKET`, `MINIO_FORCE_PATH_STYLE`
+- `S3_MULTIPART_THRESHOLD_BYTES`, `S3_MULTIPART_CHUNKSIZE_BYTES`, `S3_TRANSFER_CONCURRENCY`
 
-### Database Layer
-- `backend_module/database.py`:
-  - `DataBaseManager`: thread-safe SurrealDB client wrapper using a lock around `query()` to guard multi-threaded access from the orchestrator.
-  - Retries connection for up to ~5 seconds before raising.
+Legacy fallbacks exist for `SURREAL_ENDPOINT`, `SURREAL_NAMESPACE`, `SURREAL_DATABASE`, `SURREAL_USERNAME`, `SURREAL_PASSWORD`, `S3_ENDPOINT`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `S3_BUCKET`. Do not add new code that only supports legacy names.
 
-### Encoding Layer
-- `backend_module/encoder.py`:
-  - `encode_to_hls(input_path, out_dir=None)`: produces HLS VOD (fMP4) with playlist + init + `seg_XXXXX.m4s`, NVENC-first with libx265 fallback.
-  - `probe_video(path)`: `ffprobe` wrapper to extract duration, width/height, frame rate, and codec.
+## Dockerfiles
 
-### Query Helpers
-- `query/file_query.py`:
-  - `get_file(...)`, `get_s3key(...)`: fetch file record or its S3 key; raise `FileRecordNotFound` if missing.
-- `query/encoded_segment_query.py`:
-  - `insert_encoded_segment(...)`: inserts one encoded segment record with file linkage, size, bucket, and rich `meta` (duration, index, time ranges, dimensions, fps, codec).
-- `query/hls_job_query.py`:
-  - `queue_unhls_video_jobs(...)`: enqueues HLS jobs for videos/results missing HLS.
-  - `set_hls_job_status(...)`: guards state transitions (`queued -> in_progress -> complete`, `faild` always allowed).
-- `query/utils.py`:
-  - Response helpers `first_result(...)`, `extract_results(...)`, and Surreal record id utility `rid_leaf(...)`.
+Current Dockerfiles are:
 
-### UUID Utilities
-- `backend_module/uuid_tools.py`: `get_uuid(length)` returns a lowercase alphanumeric UUID string cropped to the requested length.
+- `Dockerfile.base`: non-GPU/base worker image
+- `Dockerfile.gpu`: GPU inference/CV image
 
-### Ad-hoc Script
-- `test.py`: small, local example to download/upload using `MinioS3Uploader` with hardcoded endpoints and credentials.
+Do not introduce new references to old `Dockerfile.cv` or `Dockerfile.mlx`.
 
-## End-to-End Job Flow
-- Discover work: enqueue new `hls_job` for eligible `file`/`inference_result` records.
-- Fetch queued HLS jobs and mark each `in_progress` before processing.
-- Download the source object from S3/MinIO to a per-job `work/hls_<job_id>/` directory.
-- Encode to HLS (playlist + init + fMP4 segments), upload under `hls/<file_id>/...`.
-- Insert `hls_playlist`/`hls_segment` rows with timing and video metadata.
-- Mark job `complete` on success; `faild` on any error. Always remove local `work/hls_<job_id>/`.
+## Inference pipeline notes
 
-## Configuration
-- Object storage: use environment variables and pass to `MinioS3Uploader`:
-  - `S3_ENDPOINT`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `S3_BUCKET`.
-- Database (SurrealDB): set and pass via env:
-  - `SURREAL_ENDPOINT`, `SURREAL_USERNAME`, `SURREAL_PASSWORD`, `SURREAL_NAMESPACE`, `SURREAL_DATABASE`.
-- Note: current `video_manager.py` and `test.py` contain hardcoded endpoints/credentials for local development. Replace with environment-driven configuration before deployment.
+- Current production path is `taskType=one-shot-object-detection`, `model=samurai-ulr`.
+- Expected input is one dataset with exactly one video.
+- UI can pass `inferenceBackend` as `tensorrt-fp16`, `pytorch-fp16`, or `pytorch-fp32`.
+- UI can pass `rtdetrEpochs`; default remains 4.
+- RT-DETR training should use pretrained `rtdetr-l.pt` when configured that way.
+- TensorRT behavior is GPU/driver dependent. Keep PyTorch FP32/FP16 fallback paths working.
+- Result videos should be uploaded as inference artifacts and then HLS encoded by `video_manager.py` / `cv-backend`.
 
-## Operational Notes
-- Requirements: `ffmpeg` and `ffprobe` must be installed and available on PATH; NVENC is optional—CPU fallback is automatic.
-- Concurrency:
-  - Upload/download concurrency uses `TransferConfig.max_concurrency` (per-file parts) and per-call thread pools for multi-file parallelism.
-  - Orchestrator runs up to two jobs in parallel; adjust `max_workers` as needed with DB contention in mind.
-- Error handling:
-  - S3 operations return rich status (`S3Info`) and error messages; callers must check.
-  - Encode errors set job state to `faild` and proceed with cleanup.
-- File system: job-scoped work areas under `work/` are created and cleaned per execution.
+## State values
 
-## How To Run
-- Local ad-hoc: `python test.py` to try a simple upload/download.
-- Orchestrator: `python video_manager.py` to start the polling worker.
-- Docker (example): `docker build -f docker/Dockerfile.cv -t mlops-cv .`.
+`Faild` and `StopInterrept` are existing DB/status values. Do not silently rename them. If adding normalized spelling, keep compatibility mappings.
 
-## Suggestions / TODOs
-- Replace hardcoded configuration in `video_manager.py` and `test.py` with environment variables and a small config loader.
-- Add minimal pytest coverage for:
-  - `hls_job` state transitions (valid/invalid, concurrent update guard).
-  - `object_storage` error paths (missing keys, timeouts mocked).
-  - `probe_video` parsing with fixture JSON.
-- Consider structured logging and per-job correlation IDs for observability.
+## Tests
+
+Local unit tests:
+
+```bash
+uv run pytest -q
+```
+
+Integration tests live in `../mlops-cloud/e2e` and should be run from the `mlops-cloud` repo.
+
+```bash
+cd ../mlops-cloud
+docker compose -f e2e/compose.phase2.yml up --build --abort-on-container-exit --exit-code-from backend-test backend-test
+docker compose -f e2e/compose.phase2.yml down -v
+```
+
+GPU pipeline:
+
+```bash
+cd ../mlops-cloud
+docker compose -f e2e/compose.phase4.yml up --build --abort-on-container-exit --exit-code-from phase4-test phase4-test
+docker compose -f e2e/compose.phase4.yml down -v
+```
+
+Phase4 requires NVIDIA container runtime and can take minutes.
+
+## Security / operations
+
+- Do not hardcode real credentials.
+- `terminal_manager.py` can bridge to host SSH. Treat it as sensitive and avoid exposing it without auth/network controls.
+- Cleanup is asynchronous. UI deletes usually mark records `dead=true`; backend cleaner removes DB/S3 later.
+- Work directories must be job-scoped and cleaned on failure.
+- HLS output should register playlist/segments in DB and upload all referenced objects to S3.
