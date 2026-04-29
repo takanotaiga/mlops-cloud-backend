@@ -12,6 +12,7 @@ from backend_module.encoder import probe_video, create_thumbnail, encode_to_hls,
 from backend_module.uuid_tools import get_uuid
 from query import file_query
 from query import inference_result_query
+from query import inference_job_log_query
 from query import hls_job_query
 from query import merge_group_query
 from query.hls_playlist_query import insert_hls_playlist, get_playlist_for_file
@@ -76,7 +77,36 @@ class TaskRunner:
                 return
 
             work_dir = Path("work") / ("hls_" + rid_leaf(job_id))
+            parent_inference_job_id = None
+            if str(file_id).startswith("inference_result:"):
+                parent_inference_job_id = inference_job_log_query.get_job_id_for_inference_result(
+                    self.db_manager,
+                    str(file_id),
+                )
+            cv_log_seq = 0
+
+            def _cv_log(message: str):
+                nonlocal cv_log_seq
+                print(message)
+                if not parent_inference_job_id:
+                    return
+                cv_log_seq += 1
+                try:
+                    inference_job_log_query.append_job_log(
+                        self.db_manager,
+                        job_id=parent_inference_job_id,
+                        source="cv",
+                        stream="stdout",
+                        message=message,
+                        seq=cv_log_seq,
+                        archive_uploader=self.uploader,
+                    )
+                except Exception:
+                    pass
+
             try:
+                if parent_inference_job_id:
+                    _cv_log(f"[cv] hls_job={job_id} inference_job={parent_inference_job_id} started backend={backend}")
                 # ステータスを in_progress へ
                 hls_job_query.set_hls_job_status(self.db_manager, job_id, "in_progress")
 
@@ -98,6 +128,7 @@ class TaskRunner:
                     raise RuntimeError(f"Download failed: {dl_res.error}")
 
                 # HLS エンコード（out/<uuid>/hls に出力される）
+                _cv_log(f"[cv] hls_job={job_id} encoding input={local_src}")
                 hls_out = encode_to_hls(
                     str(local_src), out_dir=str(work_dir / "encoded"), segment_time=6, backend=backend
                 )
@@ -113,6 +144,7 @@ class TaskRunner:
 
                 # まずプレイリスト
                 playlist_key = f"{key_prefix}/index.m3u8"
+                _cv_log(f"[cv] hls_job={job_id} uploading playlist={playlist_key} segments={len(seg_paths)}")
                 up_pl = self.uploader.upload_file_as(playlist_path, playlist_key)
                 if up_pl.status != S3Info.SUCCESS:
                     raise RuntimeError(f"Upload playlist failed: {up_pl.error}")
@@ -189,13 +221,15 @@ class TaskRunner:
 
                 # 完了
                 hls_job_query.set_hls_job_status(self.db_manager, job_id, "complete")
+                if parent_inference_job_id:
+                    _cv_log(f"[cv] hls_job={job_id} complete")
 
             except Exception as e:
                 try:
                     hls_job_query.set_hls_job_status(self.db_manager, job_id, "faild")
                 except Exception:
                     pass
-                print(f"HLS Job {job_id} failed: {e}")
+                _cv_log(f"HLS Job {job_id} failed: {e}")
             finally:
                 try:
                     if work_dir.exists():
