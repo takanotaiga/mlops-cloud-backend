@@ -11,7 +11,7 @@ dependencies = [
     "python-multipart",
     "paramiko==3.5.0",
     "requests",
-    "pynvml",
+    "nvidia-ml-py",
     "psutil"
 ]
 

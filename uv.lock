@@ -623,13 +623,13 @@ wheels = [
 
 [[package]]
 name = "mlops-cloud-backend"
-version = "1.6.0"
+version = "1.6.1"
 source = { virtual = "." }
 dependencies = [
     { name = "boto3" },
+    { name = "nvidia-ml-py" },
     { name = "paramiko" },
     { name = "psutil" },
-    { name = "pynvml" },
     { name = "python-multipart" },
     { name = "requests" },
     { name = "surrealdb" },
@@ -663,6 +663,7 @@ requires-dist = [
     { name = "hydra-core", marker = "extra == 'mlx'" },
     { name = "iopath", marker = "extra == 'mlx'" },
     { name = "loguru", marker = "extra == 'mlx'" },
+    { name = "nvidia-ml-py" },
     { name = "onnx", marker = "extra == 'mlx'", specifier = ">=1.12.0,<=1.19.1" },
     { name = "onnxruntime-gpu", marker = "extra == 'mlx'", specifier = "==1.23.2" },
     { name = "onnxslim", marker = "extra == 'mlx'", specifier = ">=0.1.71" },
@@ -671,7 +672,6 @@ requires-dist = [
     { name = "paramiko", specifier = "==3.5.0" },
     { name = "psutil" },
     { name = "pyarrow", marker = "extra == 'mlx'" },
-    { name = "pynvml" },
     { name = "python-multipart" },
     { name = "requests" },
     { name = "surrealdb", specifier = "==1.0.4" },
@@ -1183,18 +1183,6 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/dd/b6/63fd77264dae1087770a1bb414bc604470f58fbc21d83822fc9c76248076/pynacl-1.6.1-cp38-abi3-win32.whl", hash = "sha256:9fd1a4eb03caf8a2fe27b515a998d26923adb9ddb68db78e35ca2875a3830dde", size = 226585, upload-time = "2025-11-10T16:02:07.116Z" },
     { url = "https://files.pythonhosted.org/packages/12/c8/b419180f3fdb72ab4d45e1d88580761c267c7ca6eda9a20dcbcba254efe6/pynacl-1.6.1-cp38-abi3-win_amd64.whl", hash = "sha256:a569a4069a7855f963940040f35e87d8bc084cb2d6347428d5ad20550a0a1a21", size = 238923, upload-time = "2025-11-10T16:02:04.401Z" },
     { url = "https://files.pythonhosted.org/packages/35/76/c34426d532e4dce7ff36e4d92cb20f4cbbd94b619964b93d24e8f5b5510f/pynacl-1.6.1-cp38-abi3-win_arm64.whl", hash = "sha256:5953e8b8cfadb10889a6e7bd0f53041a745d1b3d30111386a1bb37af171e6daf", size = 183970, upload-time = "2025-11-10T16:02:05.786Z" },
-]
-
-[[package]]
-name = "pynvml"
-version = "13.0.1"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "nvidia-ml-py" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/5c/57/da7dc63a79f59e082e26a66ac02d87d69ea316b35b35b7a00d82f3ce3d2f/pynvml-13.0.1.tar.gz", hash = "sha256:1245991d9db786b4d2f277ce66869bd58f38ac654e38c9397d18f243c8f6e48f", size = 35226, upload-time = "2025-09-05T20:33:25.377Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/d7/4a/cac76c174bb439a0c46c9a4413fcbea5c6cabfb01879f7bbdb9fdfaed76c/pynvml-13.0.1-py3-none-any.whl", hash = "sha256:e2b20e0a501eeec951e2455b7ab444759cf048e0e13a57b08049fa2775266aa8", size = 28810, upload-time = "2025-09-05T20:33:24.13Z" },
 ]
 
 [[package]]
