@@ -52,11 +52,12 @@ Do not introduce new references to old `Dockerfile.cv` or `Dockerfile.mlx`.
 
 ## Inference pipeline notes
 
-- Current production path is `taskType=one-shot-object-detection`, `model=samurai-ulr`.
+- Current production path is `taskType=one-shot-object-detection`, `model=samurai-ulr` or `model=t260-ulr`.
 - Expected input is one dataset with exactly one video.
 - UI can pass `inferenceBackend` as `tensorrt-fp16`, `pytorch-fp16`, or `pytorch-fp32`.
 - UI can pass `rtdetrEpochs`; default remains 4.
 - RT-DETR training should use pretrained `rtdetr-l.pt` when configured that way.
+- T260-ULR uses official SAM2.1 plus RF-DETR. Keep its PyTorch FP16/FP32 path healthy; RF-DETR TensorRT export is not the default path yet.
 - TensorRT behavior is GPU/driver dependent. Keep PyTorch FP32/FP16 fallback paths working.
 - Result videos should be uploaded as inference artifacts and then HLS encoded by `video_manager.py` / `cv-backend`.
 
